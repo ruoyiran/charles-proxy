@@ -1,0 +1,6 @@
+.build/
+.build-x86_64/
+DerivedData/
+dist/
+.DS_Store
+*.xcuserstate
