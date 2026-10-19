@@ -4,9 +4,7 @@ import ProxyLabCore
 
 struct TransactionInspectorView: View {
     let transaction: CapturedTransaction
-    let showSSLSettings: () -> Void
     let showCertificateGuide: () -> Void
-    @EnvironmentObject private var model: AppModel
     @State private var selectedTab = InspectorTab.overview
 
     private enum InspectorTab: String, CaseIterable {
@@ -24,9 +22,10 @@ struct TransactionInspectorView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text(transaction.request.url).font(.headline).textSelection(.enabled)
                 HStack {
-                    Text(transaction.request.method).font(.caption.monospaced()).bold()
+                    MethodBadge(method: transaction.request.method)
                     if let status = transaction.response?.status {
-                        Text(isTunnel ? "Tunnel established (\(status))" : "HTTP \(status)")
+                        if isTunnel { Text("Tunnel established") }
+                        StatusBadge(status: status)
                     }
                     if transaction.tlsIntercepted { Label("HTTPS decrypted", systemImage: "lock.open") }
                     Spacer()
@@ -38,17 +37,9 @@ struct TransactionInspectorView: View {
             if isTunnel {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("This connection is encrypted", systemImage: "lock.fill").font(.headline)
-                    Text("This record contains the CONNECT tunnel only. Trust the ProxyLab root certificate, enable SSL Proxying for this host, then reload the page to capture its headers and bodies.")
+                    Text("This record contains an earlier CONNECT tunnel only. ProxyLab now inspects all HTTPS hosts. Trust the root certificate and reload the page to create a new decrypted request. Earlier tunnel records cannot be decrypted retrospectively.")
                         .font(.callout)
-                    HStack {
-                        Button("HTTPS Setup…", action: showCertificateGuide)
-                        Button("Enable SSL Proxying for This Host") {
-                            Task { await model.enableSSLForSelectedHost() }
-                        }
-                        .disabled(model.sslSetupInProgress)
-                        if model.sslSetupInProgress { ProgressView().controlSize(.small) }
-                        Button("SSL Settings…", action: showSSLSettings)
-                    }
+                    Button("HTTPS Setup…", action: showCertificateGuide)
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -76,10 +67,12 @@ struct TransactionInspectorView: View {
                                   contentType: transaction.response?.header("Content-Type"),
                                   contentEncoding: transaction.response?.header("Content-Encoding"),
                                   truncated: transaction.responseBodyTruncated,
-                                  suggestedName: "response-body", emptyMessage: isTunnel ? "HTTPS content has not been decrypted." : "This response has no body.")
+                                  suggestedName: "response-body", emptyMessage: isTunnel ? "HTTPS content has not been decrypted." : "This response has no body.",
+                                  supportsPreview: true, responseURL: transaction.request.url)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .id(transaction.id)
         }
     }
 
@@ -135,100 +128,6 @@ private struct HeadersInspector: View {
                     TableColumn("Value") { Text($0.value).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
                 }
             }
-        }
-    }
-}
-
-private struct BodyInspector: View {
-    let data: Data
-    let contentType: String?
-    let contentEncoding: String?
-    let truncated: Bool
-    let suggestedName: String
-    let emptyMessage: String
-    @State private var mode = "Decoded"
-    @State private var pretty = true
-    @State private var decoded = Data()
-    @State private var decodeError: String?
-    @State private var displayText = ""
-    @State private var loading = false
-
-    private var chosenBytes: Data { mode == "Decoded" && decodeError == nil ? decoded : data }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Picker("Body format", selection: $mode) {
-                    Text("Decoded").tag("Decoded")
-                    Text("Raw").tag("Raw")
-                    Text("Hex").tag("Hex")
-                }.pickerStyle(.segmented).labelsHidden().frame(width: 230)
-                Toggle("Format JSON", isOn: $pretty).toggleStyle(.checkbox).disabled(mode == "Hex")
-                Spacer()
-                Button("Copy") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(mode == "Hex" ? BodyContent.hex(chosenBytes) : BodyContent.text(chosenBytes, contentType: contentType, pretty: pretty), forType: .string)
-                }.disabled(data.isEmpty || loading)
-                Button("Save Body…") { saveBody() }.disabled(data.isEmpty || loading)
-            }
-            Text("\(data.count) captured bytes · \(contentType ?? "unknown content type") · encoding: \(contentEncoding ?? "identity")")
-                .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            if truncated { Text("Only the first 10 MB was recorded; saved data is also truncated.").font(.caption).foregroundStyle(.orange) }
-            if let decodeError, mode == "Decoded" { Text(decodeError).font(.caption).foregroundStyle(.orange) }
-            if loading {
-                ProgressView("Loading body…").frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if data.isEmpty {
-                ContentUnavailableView(emptyMessage, systemImage: "doc.text")
-            } else {
-                TextEditor(text: .constant(displayText))
-                    .font(.system(.body, design: .monospaced))
-                    .accessibilityLabel("Body content")
-                if chosenBytes.count > 256 * 1_024 {
-                    Text("Preview limited to 256 KB. Copy or Save Body includes all retained bytes.").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-        }
-        .padding(.horizontal, 12).padding(.bottom, 10)
-        .task { await decodeBody() }
-        .task(id: "\(mode)-\(pretty)") { await updateText() }
-    }
-
-    private func decodeBody() async {
-        loading = true
-        let result = await Task.detached {
-            Result { try BodyContent.decode(data, contentEncoding: contentEncoding) }
-        }.value
-        switch result {
-        case .success(let bytes): decoded = bytes; decodeError = nil
-        case .failure(let error): decoded = data; decodeError = error.localizedDescription
-        }
-        await updateText()
-        loading = false
-    }
-
-    private func updateText() async {
-        let bytes = chosenBytes
-        let selectedMode = mode
-        let formatJSON = pretty
-        let type = contentType
-        let text = await Task.detached {
-            if selectedMode == "Hex" { return BodyContent.hex(Data(bytes.prefix(256 * 1_024))) }
-            return String(BodyContent.text(bytes, contentType: type, pretty: formatJSON).prefix(256 * 1_024))
-        }.value
-        guard !Task.isCancelled else { return }
-        displayText = text
-    }
-
-    private func saveBody() {
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = suggestedName + ".bin"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try chosenBytes.write(to: url, options: .atomic) }
-        catch {
-            let alert = NSAlert()
-            alert.messageText = "Body could not be saved"
-            alert.informativeText = error.localizedDescription
-            alert.runModal()
         }
     }
 }

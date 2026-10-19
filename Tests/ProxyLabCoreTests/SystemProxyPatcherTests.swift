@@ -2,6 +2,26 @@ import XCTest
 @testable import ProxyLabCore
 
 final class SystemProxyPatcherTests: XCTestCase {
+    func testRestoreAcceptsAlreadyRestoredConfigurationWithoutChangingIt() throws {
+        let original: [String: Any] = [
+            "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 8888,
+            "ExceptionsList": ["*.local"], "FTPPassive": 1
+        ]
+        var current = original
+        current["ExceptionsList"] = ["*.local", "new.exception"]
+        current["HTTPEnable"] = 0
+        let restored = try XCTUnwrap(SystemProxyPatcher.restore(current: current, original: original, port: 8888))
+        XCTAssertTrue((restored as NSDictionary).isEqual(to: current))
+    }
+
+    func testRestoreCanHandleMixtureOfOwnedAndAlreadyRestoredServices() throws {
+        let original: [String: Any] = ["FTPPassive": 1]
+        XCTAssertNotNil(SystemProxyPatcher.restore(current: original, original: original, port: 8888))
+        let owned = SystemProxyPatcher.enable(original, port: 8888)
+        let restored = try XCTUnwrap(SystemProxyPatcher.restore(current: owned, original: original, port: 8888))
+        XCTAssertTrue((restored as NSDictionary).isEqual(to: original))
+    }
+
     func testEnablePreservesUnrelatedSettingsAndRestoreRecoversOriginal() throws {
         let original: [String: Any] = [
             "HTTPEnable": 1, "HTTPProxy": "corp.internal", "HTTPPort": 3128,

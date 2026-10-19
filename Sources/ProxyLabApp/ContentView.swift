@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showCertificateGuide = false
     @State private var confirmClearSession = false
+    @State private var requestToDelete: UUID?
 
     private var filtered: [TransactionSummary] {
         guard !search.isEmpty else { return model.summaries }
@@ -34,6 +35,17 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                     .padding(.horizontal, 10)
                     .padding(.bottom, 8)
+                HStack {
+                    Text("\(filtered.count) requests").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button { confirmClearSession = true } label: {
+                        Label("Clear", systemImage: "trash")
+                    }
+                    .disabled(model.summaries.isEmpty)
+                    .help("Clear all recorded requests")
+                    .accessibilityLabel("Clear Requests")
+                }
+                .padding(.horizontal, 12).padding(.bottom, 8)
                 if viewMode == 0 {
                     List(filtered) { item in row(item) }
                 } else {
@@ -51,9 +63,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 if let transaction = model.selectedTransaction {
                     TransactionInspectorView(transaction: transaction,
-                                             showSSLSettings: { showSettings = true },
                                              showCertificateGuide: { showCertificateGuide = true })
-                        .id(transaction.id)
                 } else {
                     ContentUnavailableView("Select a request", systemImage: "network",
                                            description: Text("Recorded requests appear in Sequence and Structure."))
@@ -62,6 +72,9 @@ struct ContentView: View {
                 HStack {
                     Circle().fill(model.recordingEnabled ? .red : .gray).frame(width: 8, height: 8)
                     Text(model.statusText)
+                    if model.proxyUnavailable {
+                        Button("Retry") { Task { await model.start() } }
+                    }
                     Spacer()
                     Text("\(model.summaries.count) requests")
                     if !model.pendingBreakpoints.isEmpty {
@@ -99,12 +112,22 @@ struct ContentView: View {
         .sheet(isPresented: $showRewrite) { RewriteRulesView().environmentObject(model).frame(minWidth: 650, minHeight: 460) }
         .sheet(isPresented: $showBreakpointRules) { BreakpointRulesView().environmentObject(model).frame(minWidth: 540, minHeight: 380) }
         .sheet(isPresented: $showPending) { PendingBreakpointsView().environmentObject(model).frame(minWidth: 760, minHeight: 500) }
-        .sheet(isPresented: $showSettings) { ProxySettingsView().environmentObject(model).frame(minWidth: 540, minHeight: 570) }
+        .sheet(isPresented: $showSettings) { ProxySettingsView().environmentObject(model).frame(minWidth: 540, minHeight: 430) }
         .sheet(isPresented: $showCertificateGuide) { CertificateGuideView().environmentObject(model).frame(minWidth: 600, minHeight: 400) }
         .confirmationDialog("Clear all recorded requests?", isPresented: $confirmClearSession) {
             Button("Clear Session", role: .destructive) { Task { await model.clearSession() } }
         } message: {
             Text("This removes the current local session and cannot be undone.")
+        }
+        .confirmationDialog("Delete this recorded request?", isPresented: Binding(
+            get: { requestToDelete != nil }, set: { if !$0 { requestToDelete = nil } }
+        )) {
+            Button("Delete Request", role: .destructive) {
+                if let id = requestToDelete { Task { await model.deleteRequest(id) } }
+                requestToDelete = nil
+            }
+        } message: {
+            Text("The saved headers and bodies for this request will be removed.")
         }
         .alert("ProxyLab", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -134,29 +157,30 @@ struct ContentView: View {
             Task { await model.select(item.id) }
         } label: {
             HStack(spacing: 8) {
-                Text(item.method).font(.caption.monospaced()).frame(width: 44, alignment: .leading)
+                MethodBadge(method: item.method)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(URL(string: item.url)?.path.isEmpty == false ? (URL(string: item.url)?.path ?? item.url) : item.url)
                         .lineLimit(1)
                     Text(item.host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 4)
-                Text(item.status.map(String.init) ?? "…")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle((item.status ?? 200) >= 400 ? .red : .secondary)
+                StatusBadge(status: item.status)
             }
             .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .listRowBackground(model.selectedID == item.id ? Color.accentColor.opacity(0.16) : Color.clear)
+        .contextMenu {
+            Button("Delete Request", role: .destructive) { requestToDelete = item.id }
+            Button("Clear All Requests", role: .destructive) { confirmClearSession = true }
+        }
     }
 }
 
 private struct ProxySettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
-    @State private var hosts = ""
     @State private var trustedDNSHosts = ""
     @State private var port = "8888"
 
@@ -164,12 +188,10 @@ private struct ProxySettingsView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Proxy Settings").font(.title2).bold()
             HStack { Text("HTTP proxy port"); TextField("8888", text: $port).frame(width: 85) }
-            Text("SSL Proxying locations").font(.headline)
+            Text("HTTPS inspection").font(.headline)
             CertificateTrustStatusView()
-            Text("One hostname or wildcard per line. Empty means HTTPS stays encrypted.")
+            Text("HTTPS inspection is enabled for all hosts. Trust the ProxyLab root certificate to view request and response headers and bodies.")
                 .font(.caption).foregroundStyle(.secondary)
-            TextEditor(text: $hosts).font(.system(.body, design: .monospaced))
-                .border(.separator).frame(height: 130)
             Text("Trusted DNS routing").font(.headline)
             Text("For hosts whose local DNS points to a blocked or incorrect address. One hostname per line. ProxyLab resolves these names through dns.google while keeping the original TLS hostname.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -183,7 +205,6 @@ private struct ProxySettingsView: View {
                 Button("Cancel") { dismiss() }
                 Button("Apply") {
                     Task {
-                        await model.updateSSLHosts(hosts)
                         await model.updateTrustedDNSHosts(trustedDNSHosts)
                         if let newPort = Int(port), (1...65535).contains(newPort), newPort != model.proxyPort {
                             await model.restart(port: newPort)
@@ -191,14 +212,11 @@ private struct ProxySettingsView: View {
                         dismiss()
                     }
                 }
-                .disabled(model.sslSetupInProgress)
                 .keyboardShortcut(.defaultAction)
-                if model.sslSetupInProgress { ProgressView().controlSize(.small) }
             }
         }
         .padding(20)
         .onAppear {
-            hosts = model.sslHostsText
             trustedDNSHosts = model.trustedDNSHostsText
             port = String(model.proxyPort)
         }
@@ -216,7 +234,9 @@ private struct CertificateGuideView: View {
             CertificateTrustStatusView()
             Text("1. Export the ProxyLab root certificate. The private key stays in this Mac's Keychain.")
             Text("2. Open Keychain Access, import the certificate into your login keychain, and explicitly trust it for SSL.")
-            Text("3. Add the hostnames you want to inspect in Proxy Settings. Other HTTPS connections remain opaque tunnels.")
+            Text("3. Reload the browser page. ProxyLab inspects all HTTPS hosts automatically; no hostname configuration is needed.")
+            Text("Apps that pin certificates may reject HTTPS inspection.")
+                .font(.caption).foregroundStyle(.secondary)
             Text("Remove trust in Keychain Access when you no longer need HTTPS inspection.")
                 .foregroundStyle(.secondary)
             Spacer()

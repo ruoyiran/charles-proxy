@@ -22,20 +22,28 @@ public enum SystemProxyPatcher {
     }
 
     public static func restore(current: [String: Any], original: [String: Any], port: Int) -> [String: Any]? {
+        if matches(current: current, expected: original) { return current }
         let owned = enable(original, port: port)
-        guard managedKeys.allSatisfy({ key in
-            guard let expected = owned[key] as? NSObject else { return current[key] == nil }
-            if current[key] == nil,
-               (key == "ProxyAutoConfigEnable" || key == "ProxyAutoDiscoveryEnable"),
-               (expected as? NSNumber)?.intValue == 0 { return true }
-            return (current[key] as? NSObject)?.isEqual(expected) == true
-        }) else { return nil }
+        guard matches(current: current, expected: owned) else { return nil }
         var result = current
         for key in managedKeys {
             if let originalValue = original[key] { result[key] = originalValue }
             else { result.removeValue(forKey: key) }
         }
         return result
+    }
+
+    private static func matches(current: [String: Any], expected: [String: Any]) -> Bool {
+        managedKeys.allSatisfy { key in
+            if key.hasSuffix("Enable") {
+                // SystemConfiguration may omit disabled flags instead of storing zero.
+                let currentFlag = (current[key] as? NSNumber)?.intValue ?? 0
+                let expectedFlag = (expected[key] as? NSNumber)?.intValue ?? 0
+                return currentFlag == expectedFlag
+            }
+            guard let value = expected[key] as? NSObject else { return current[key] == nil }
+            return (current[key] as? NSObject)?.isEqual(value) == true
+        }
     }
 }
 
@@ -56,8 +64,15 @@ public enum SystemProxyError: LocalizedError {
 @MainActor
 public final class SystemProxyManager {
     private let snapshotURL: URL
+    private let configurationReader: () throws -> [String: [String: Any]]
+    private let pendingApply: (() throws -> Void)?
 
-    public init(snapshotURL: URL) { self.snapshotURL = snapshotURL }
+    public init(snapshotURL: URL, configurationReader: (() throws -> [String: [String: Any]])? = nil,
+                pendingApply: (() throws -> Void)? = nil) {
+        self.snapshotURL = snapshotURL
+        self.configurationReader = configurationReader ?? Self.readConfigurations
+        self.pendingApply = pendingApply
+    }
 
     public var hasPendingRestore: Bool { FileManager.default.fileExists(atPath: snapshotURL.path) }
 
@@ -101,14 +116,38 @@ public final class SystemProxyManager {
     public func restore() throws {
         guard hasPendingRestore else { return }
         let data = try Data(contentsOf: snapshotURL)
-        guard let snapshot = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+        guard var snapshot = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
               let port = snapshot["port"] as? Int,
               let originals = snapshot["services"] as? [String: [String: Any]] else {
             throw SystemProxyError.conflict
         }
+        // A previous restore, failed enable, or manual change may already have restored
+        // every service. Clear stale recovery state without prompting for authorization.
+        let configurations = try configurationReader()
+        var needsChanges = false
+        for (id, original) in originals {
+            guard let current = configurations[id] else { continue }
+            guard let restored = SystemProxyPatcher.restore(current: current, original: original, port: port) else {
+                throw SystemProxyError.conflict
+            }
+            if !(current as NSDictionary).isEqual(to: restored) { needsChanges = true }
+        }
+        let requiresApply = snapshot["restoreNeedsApply"] as? Bool ?? false
+        if !needsChanges, !requiresApply {
+            try FileManager.default.removeItem(at: snapshotURL)
+            return
+        }
+        if !needsChanges, requiresApply, let pendingApply {
+            try pendingApply()
+            try FileManager.default.removeItem(at: snapshotURL)
+            return
+        }
         let (preferences, authorization) = try openPreferences()
         defer { AuthorizationFree(authorization, []) }
         let services = SCNetworkServiceCopyAll(preferences) as? [SCNetworkService] ?? []
+        // Validate all services before staging any changes. Re-read after authorization
+        // so a user's intervening changes are never overwritten.
+        var changes: [(SCNetworkProtocol, [String: Any])] = []
         for service in services {
             guard let id = SCNetworkServiceGetServiceID(service) as String?,
                   let original = originals[id],
@@ -117,12 +156,40 @@ public final class SystemProxyManager {
             guard let restored = SystemProxyPatcher.restore(current: current, original: original, port: port) else {
                 throw SystemProxyError.conflict
             }
+            if !(current as NSDictionary).isEqual(to: restored) { changes.append((proxyProtocol, restored)) }
+        }
+        for (proxyProtocol, restored) in changes {
             guard SCNetworkProtocolSetConfiguration(proxyProtocol, restored as CFDictionary) else {
                 throw SystemProxyError.preferences(SCError())
             }
         }
-        try commit(preferences)
+        if !changes.isEmpty {
+            // Commit and apply are separate operations. Persist this marker first so a
+            // failed apply can be retried even after disk settings match the originals.
+            snapshot["restoreNeedsApply"] = true
+            try PropertyListSerialization.data(fromPropertyList: snapshot, format: .binary, options: 0)
+                .write(to: snapshotURL, options: .atomic)
+            try commit(preferences)
+        } else if requiresApply {
+            guard SCPreferencesApplyChanges(preferences) else { throw SystemProxyError.preferences(SCError()) }
+        }
         try FileManager.default.removeItem(at: snapshotURL)
+    }
+
+    private static func readConfigurations() throws -> [String: [String: Any]] {
+        guard let preferences = SCPreferencesCreate(nil, "ProxyLab" as CFString, nil) else {
+            throw SystemProxyError.preferences(SCError())
+        }
+        guard let services = SCNetworkServiceCopyAll(preferences) as? [SCNetworkService] else {
+            throw SystemProxyError.noServices
+        }
+        var result: [String: [String: Any]] = [:]
+        for service in services {
+            guard let id = SCNetworkServiceGetServiceID(service) as String?,
+                  let proxyProtocol = SCNetworkServiceCopyProtocol(service, kSCNetworkProtocolTypeProxies) else { continue }
+            result[id] = SCNetworkProtocolGetConfiguration(proxyProtocol) as? [String: Any] ?? [:]
+        }
+        return result
     }
 
     private func openPreferences() throws -> (SCPreferences, AuthorizationRef) {

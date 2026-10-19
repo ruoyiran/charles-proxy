@@ -3,6 +3,7 @@ import Security
 import X509
 import Crypto
 import NIOSSL
+import Darwin
 
 public actor CertificateAuthority {
     public nonisolated let rootCertificatePEM: String
@@ -72,7 +73,7 @@ public actor CertificateAuthority {
             extensions: Certificate.Extensions {
                 Critical(BasicConstraints.notCertificateAuthority)
                 Critical(KeyUsage(digitalSignature: true))
-                SubjectAlternativeNames([.dnsName(canonicalHost)])
+                SubjectAlternativeNames([Self.subjectAlternativeName(for: canonicalHost)])
                 try ExtendedKeyUsage([.serverAuth])
             },
             issuerPrivateKey: .init(privateKey)
@@ -108,6 +109,20 @@ public actor CertificateAuthority {
             },
             issuerPrivateKey: .init(key)
         )
+    }
+
+    private static func subjectAlternativeName(for host: String) -> GeneralName {
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, host, &ipv4) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv4) { Array($0) }
+            return .ipAddress(.init(contentBytes: bytes[...]))
+        }
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, host, &ipv6) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv6) { Array($0) }
+            return .ipAddress(.init(contentBytes: bytes[...]))
+        }
+        return .dnsName(host)
     }
 
     private static func serial() throws -> Certificate.SerialNumber {

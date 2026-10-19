@@ -76,4 +76,10 @@ public actor SessionStore {
     public func clear() throws {
         try database.write { db in try db.execute(sql: "DELETE FROM transactions") }
     }
+
+    public func remove(id: UUID) throws {
+        try database.write { db in
+            try db.execute(sql: "DELETE FROM transactions WHERE id = ?", arguments: [id.uuidString])
+        }
+    }
 }

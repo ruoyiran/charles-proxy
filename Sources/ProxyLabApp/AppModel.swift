@@ -12,22 +12,22 @@ final class AppModel: ObservableObject {
     @Published var pendingBreakpoints: [PendingBreakpoint] = []
     @Published var rewriteRules: [RewriteRule] = []
     @Published var breakpointRules: [BreakpointRule] = []
-    @Published var sslHostsText = ""
     @Published var trustedDNSHostsText = ""
     @Published var recordingEnabled = true
     @Published var systemProxyEnabled = false
     @Published var hasPendingRestore = false
     @Published var proxyPort = 8888
     @Published var statusText = "Starting proxy…"
+    @Published var proxyUnavailable = false
     @Published var errorMessage: String?
     @Published var rootCertificateStatus = "Not checked"
     @Published var isCheckingCertificateTrust = false
     @Published var certificateTrustCheckedAt: Date?
-    @Published var sslSetupInProgress = false
 
     private let supportDirectory: URL
     private let proxySettings: SystemProxyManager
     private let certificateTrustEvaluator: @Sendable (URL) async -> String
+    private let certificateAuthorityLoader: @Sendable (URL) throws -> CertificateAuthority
     private var store: SessionStore?
     private var engine: ProxyEngine?
     private var authority: CertificateAuthority?
@@ -35,21 +35,24 @@ final class AppModel: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var started = false
 
-    init(certificateTrustEvaluator: @escaping @Sendable (URL) async -> String = { url in
+    init(supportDirectory: URL? = nil,
+         certificateAuthorityLoader: @escaping @Sendable (URL) throws -> CertificateAuthority = {
+             try CertificateAuthority(persistentDirectory: $0)
+         },
+         certificateTrustEvaluator: @escaping @Sendable (URL) async -> String = { url in
         await Task.detached { AppModel.evaluateRootCertificate(at: url) }.value
     }) {
         self.certificateTrustEvaluator = certificateTrustEvaluator
-        supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        self.certificateAuthorityLoader = certificateAuthorityLoader
+        self.supportDirectory = supportDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ProxyLab", isDirectory: true)
+        let supportDirectory = self.supportDirectory
         proxySettings = SystemProxyManager(snapshotURL: supportDirectory.appendingPathComponent("proxy-snapshot.plist"))
         hasPendingRestore = proxySettings.hasPendingRestore
         if let rules = try? Data(contentsOf: supportDirectory.appendingPathComponent("rewrite-rules.json")),
            let parsed = try? JSONDecoder().decode([RewriteRule].self, from: rules) { rewriteRules = parsed }
         if let rules = try? Data(contentsOf: supportDirectory.appendingPathComponent("breakpoint-rules.json")),
            let parsed = try? JSONDecoder().decode([BreakpointRule].self, from: rules) { breakpointRules = parsed }
-        if let text = try? String(contentsOf: supportDirectory.appendingPathComponent("ssl-hosts.txt"), encoding: .utf8) {
-            sslHostsText = text
-        }
         if let text = try? String(contentsOf: supportDirectory.appendingPathComponent("trusted-dns-hosts.txt"), encoding: .utf8) {
             trustedDNSHostsText = text
         }
@@ -58,6 +61,8 @@ final class AppModel: ObservableObject {
     func start() async {
         guard !started else { return }
         started = true
+        proxyUnavailable = false
+        errorMessage = nil
         do {
             try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: supportDirectory.path)
@@ -70,13 +75,12 @@ final class AppModel: ObservableObject {
                 }
             }
             try await startEngine(store: openedStore)
-            if !sslHostPatterns.isEmpty {
-                Task { [weak self] in
-                    do { _ = try await self?.ensureAuthority() }
-                    catch { self?.errorMessage = error.localizedDescription }
-                }
-            }
+            await refreshRootCertificateStatus()
         } catch {
+            refreshTask?.cancel()
+            refreshTask = nil
+            started = false
+            proxyUnavailable = true
             statusText = "Proxy unavailable"
             errorMessage = error.localizedDescription
         }
@@ -87,21 +91,32 @@ final class AppModel: ObservableObject {
             do { try proxySettings.restore(); systemProxyEnabled = false; hasPendingRestore = false }
             catch { errorMessage = error.localizedDescription; return }
         }
+        refreshTask?.cancel()
+        refreshTask = nil
         await engine?.stop()
         engine = nil
         proxyPort = port
-        guard let store else { return }
-        do { try await startEngine(store: store) }
-        catch { statusText = "Proxy unavailable"; errorMessage = error.localizedDescription }
+        started = false
+        await start()
+    }
+
+    func stop() async {
+        refreshTask?.cancel()
+        refreshTask = nil
+        await engine?.stop()
+        engine = nil
+        started = false
     }
 
     private func startEngine(store: SessionStore) async throws {
+        statusText = "Preparing HTTPS inspection…"
+        let authority = try await ensureAuthority()
         let proxy = ProxyEngine(store: store, trustedResolver: GoogleHTTPSDNSResolver(),
                                 trustedDNSHosts: Set(trustedDNSHostPatterns))
         await proxy.setRules(rewriteRules)
         await proxy.breakpointCenter.setRules(breakpointRules)
         await proxy.setRecordingEnabled(recordingEnabled)
-        if let authority { await proxy.configureTLS(authority: authority, includeHosts: sslHostPatterns) }
+        await proxy.configureTLS(authority: authority)
         do {
             proxyPort = try await proxy.start(port: proxyPort)
             engine = proxy
@@ -112,12 +127,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private var sslHostPatterns: [String] {
-        sslHostsText.split(whereSeparator: { $0.isNewline || $0 == "," })
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-    }
-
     private var trustedDNSHostPatterns: [String] {
         trustedDNSHostsText.split(whereSeparator: { $0.isNewline || $0 == "," })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
@@ -125,6 +134,7 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() async {
+        hasPendingRestore = proxySettings.hasPendingRestore
         if let store {
             do { summaries = try await store.listSummaries(limit: 1_000) }
             catch { errorMessage = error.localizedDescription }
@@ -140,18 +150,6 @@ final class AppModel: ObservableObject {
             if selectedID == id { selectedTransaction = loaded }
         }
         catch { errorMessage = error.localizedDescription }
-    }
-
-    func enableSSLForSelectedHost() async {
-        guard let host = selectedTransaction.flatMap({ URL(string: $0.request.url)?.host }) else { return }
-        await refreshRootCertificateStatus()
-        guard rootCertificateStatus == "Trusted for SSL" else {
-            errorMessage = "Open HTTPS Setup, export the root certificate, and trust it for SSL in Keychain Access first. Then enable SSL Proxying for \(host) and reload the page."
-            return
-        }
-        var hosts = sslHostPatterns
-        if !hosts.contains(host) { hosts.append(host) }
-        await updateSSLHosts(hosts.joined(separator: "\n"))
     }
 
     func refreshRootCertificateStatus() async {
@@ -206,32 +204,16 @@ final class AppModel: ObservableObject {
     }
 
     func restorePreviousProxy() {
+        defer { hasPendingRestore = proxySettings.hasPendingRestore }
         do {
             try proxySettings.restore()
-            hasPendingRestore = false
             systemProxyEnabled = false
+            errorMessage = nil
         } catch { errorMessage = error.localizedDescription }
     }
 
     func restoreSystemProxyOnExit() {
         if proxySettings.hasPendingRestore { try? proxySettings.restore() }
-    }
-
-    func updateSSLHosts(_ text: String) async {
-        sslHostsText = text
-        sslSetupInProgress = true
-        defer { sslSetupInProgress = false }
-        do {
-            try text.write(to: supportDirectory.appendingPathComponent("ssl-hosts.txt"), atomically: true, encoding: .utf8)
-            if let engine {
-                if sslHostPatterns.isEmpty, let authority {
-                    await engine.configureTLS(authority: authority, includeHosts: [])
-                } else if !sslHostPatterns.isEmpty {
-                    let loaded = try await ensureAuthority()
-                    await engine.configureTLS(authority: loaded, includeHosts: sslHostPatterns)
-                }
-            }
-        } catch { errorMessage = error.localizedDescription }
     }
 
     func updateTrustedDNSHosts(_ text: String) async {
@@ -247,15 +229,15 @@ final class AppModel: ObservableObject {
         if let authority { return authority }
         if let authorityTask { return try await authorityTask.value }
         let directory = supportDirectory
+        let loader = certificateAuthorityLoader
         let task = Task.detached(priority: .userInitiated) {
-            try CertificateAuthority(persistentDirectory: directory)
+            try loader(directory)
         }
         authorityTask = task
         do {
             let loaded = try await task.value
             authority = loaded
             authorityTask = nil
-            if let engine { await engine.configureTLS(authority: loaded, includeHosts: sslHostPatterns) }
             return loaded
         } catch {
             authorityTask = nil
@@ -290,6 +272,17 @@ final class AppModel: ObservableObject {
             summaries = []
             selectedTransaction = nil
             selectedID = nil
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func deleteRequest(_ id: UUID) async {
+        do {
+            try await store?.remove(id: id)
+            summaries.removeAll { $0.id == id }
+            if selectedID == id {
+                selectedID = nil
+                selectedTransaction = nil
+            }
         } catch { errorMessage = error.localizedDescription }
     }
 

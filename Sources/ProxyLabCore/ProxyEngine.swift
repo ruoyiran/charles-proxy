@@ -78,7 +78,7 @@ public actor ProxyEngine {
         trustedDNSHosts = Set(hosts.map { $0.lowercased() })
     }
 
-    public func configureTLS(authority: CertificateAuthority, includeHosts: [String]) {
+    public func configureTLS(authority: CertificateAuthority, includeHosts: [String] = ["*"]) {
         certificateAuthority = authority
         sslHosts = includeHosts.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) }
     }

@@ -1,6 +1,7 @@
 import Foundation
 import AsyncHTTPClient
 import Darwin
+import NIOPosix
 
 public protocol TrustedHostResolving: Sendable {
     func resolve(host: String) async throws -> String
@@ -41,7 +42,10 @@ public actor GoogleHTTPSDNSResolver: TrustedHostResolving {
         var configuration = HTTPClient.Configuration(redirectConfiguration: .disallow, proxy: nil)
         configuration.dnsOverride = ["dns.google": "8.8.8.8"]
         configuration.httpVersion = .http1Only
-        self.client = HTTPClient(configuration: configuration)
+        // Use direct NIO sockets so macOS does not route this proxy's own DNS lookup
+        // through the system HTTPS proxy when inspection is enabled for all hosts.
+        self.client = HTTPClient(eventLoopGroupProvider: .shared(MultiThreadedEventLoopGroup.singleton),
+                                 configuration: configuration)
     }
 
     public func resolve(host: String) async throws -> String {
