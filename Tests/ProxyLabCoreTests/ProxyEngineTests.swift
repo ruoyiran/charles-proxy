@@ -144,6 +144,192 @@ final class ProxyEngineTests: XCTestCase {
         XCTAssertEqual(transactions.first?.tlsIntercepted, false)
     }
 
+    func testOpaqueConnectCanUseResolvedAddressWhileKeepingOriginalTLSHost() async throws {
+        let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let origin = try await ServerBootstrap(group: originGroup)
+            .childChannelInitializer { channel in
+                do { try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: upstreamContext)) }
+                catch { return channel.eventLoop.makeFailedFuture(error) }
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(FixtureOriginHandler())
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let originPort = try XCTUnwrap(origin.localAddress?.port)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rootURL = directory.appendingPathComponent("upstream-root.pem")
+        try upstreamCA.rootCertificatePEM.write(to: rootURL, atomically: true, encoding: .utf8)
+        let store = try SessionStore(path: directory.appendingPathComponent("sessions.sqlite").path)
+        let proxy = ProxyEngine(store: store, connectAddressOverrides: ["localhost": "127.0.0.1"])
+        let proxyPort = try await proxy.start(port: 0)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--show-error", "--noproxy", "", "--proxy", "http://127.0.0.1:\(proxyPort)",
+                             "--cacert", rootURL.path, "https://localhost:\(originPort)/fixture"]
+        let output = Pipe()
+        let errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let body = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        await proxy.stop()
+        try await origin.close().get()
+        try await originGroup.shutdownGracefully()
+
+        XCTAssertEqual(process.terminationStatus, 0, stderr ?? "")
+        XCTAssertEqual(body, "hello from origin")
+    }
+
+    func testGoogleStyleCONNECTUsesTrustedDNSWhenSystemDNSReturnsPrivateAddress() async throws {
+        let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
+        let upstreamContext = try await upstreamCA.serverContext(for: "www.google.com.hk")
+        let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let origin = try await ServerBootstrap(group: originGroup)
+            .childChannelInitializer { channel in
+                do { try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: upstreamContext)) }
+                catch { return channel.eventLoop.makeFailedFuture(error) }
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(FixtureOriginHandler())
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let originPort = try XCTUnwrap(origin.localAddress?.port)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rootURL = directory.appendingPathComponent("upstream-root.pem")
+        try upstreamCA.rootCertificatePEM.write(to: rootURL, atomically: true, encoding: .utf8)
+        let store = try SessionStore(path: directory.appendingPathComponent("sessions.sqlite").path)
+        let resolver = StaticTestResolver(address: "127.0.0.1")
+        let proxy = ProxyEngine(store: store, trustedResolver: resolver,
+                                trustedDNSHosts: ["www.google.com.hk"])
+        let proxyPort = try await proxy.start(port: 0)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--show-error", "--noproxy", "", "--proxy", "http://127.0.0.1:\(proxyPort)",
+                             "--cacert", rootURL.path, "https://www.google.com.hk:\(originPort)/fixture"]
+        let output = Pipe()
+        let errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let body = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        await proxy.stop()
+        try await origin.close().get()
+        try await originGroup.shutdownGracefully()
+
+        XCTAssertEqual(process.terminationStatus, 0, stderr ?? "")
+        XCTAssertEqual(body, "hello from origin")
+        let queried = await resolver.queriedHosts
+        XCTAssertEqual(queried, ["www.google.com.hk"])
+    }
+
+    func testTrustedDNSResolverGetsPublicAddressForGoogle() async throws {
+        guard ProcessInfo.processInfo.environment["PROXYLAB_LIVE_NETWORK_TESTS"] == "1" else {
+            throw XCTSkip("Set PROXYLAB_LIVE_NETWORK_TESTS=1 to exercise the public DNS endpoint")
+        }
+        let resolver = GoogleHTTPSDNSResolver()
+        let address: String
+        do {
+            address = try await resolver.resolve(host: "www.google.com.hk")
+        } catch {
+            await resolver.shutdown()
+            throw error
+        }
+        await resolver.shutdown()
+        var parsed = in_addr()
+        XCTAssertEqual(inet_pton(AF_INET, address, &parsed), 1)
+        XCTAssertFalse(address.hasPrefix("10."))
+    }
+
+    func testLiveGooglePageSucceedsThroughTrustedDNSProxy() async throws {
+        guard ProcessInfo.processInfo.environment["PROXYLAB_LIVE_NETWORK_TESTS"] == "1" else {
+            throw XCTSkip("Set PROXYLAB_LIVE_NETWORK_TESTS=1 to exercise Google through ProxyLab")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try SessionStore(path: directory.appendingPathComponent("sessions.sqlite").path)
+        let proxy = ProxyEngine(store: store, trustedResolver: GoogleHTTPSDNSResolver(),
+                                trustedDNSHosts: ["www.google.com.hk"])
+        let port = try await proxy.start(port: 0)
+        for attempt in 1...3 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+            process.arguments = ["--silent", "--show-error", "--noproxy", "", "--max-time", "20",
+                                 "--proxy", "http://127.0.0.1:\(port)", "--output", "/dev/null",
+                                 "--write-out", "%{http_code}", "https://www.google.com.hk/"]
+            let output = Pipe()
+            let errors = Pipe()
+            process.standardOutput = output
+            process.standardError = errors
+            try process.run()
+            while process.isRunning { try await Task.sleep(for: .milliseconds(20)) }
+            let status = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            XCTAssertEqual(process.terminationStatus, 0, "Attempt \(attempt): \(stderr)")
+            XCTAssertEqual(status, "200", "Attempt \(attempt): \(stderr)")
+        }
+        await proxy.stop()
+    }
+
+    func testTrustedDNSCanRouteInterceptedHTTPSUpstream() async throws {
+        let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
+        let upstreamContext = try await upstreamCA.serverContext(for: "www.google.com.hk")
+        let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let origin = try await ServerBootstrap(group: originGroup)
+            .childChannelInitializer { channel in
+                do { try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: upstreamContext)) }
+                catch { return channel.eventLoop.makeFailedFuture(error) }
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(FixtureOriginHandler())
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let originPort = try XCTUnwrap(origin.localAddress?.port)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rootURL = directory.appendingPathComponent("proxy-root.pem")
+        let proxyCA = try CertificateAuthority(persistentDirectory: nil)
+        try proxyCA.rootCertificatePEM.write(to: rootURL, atomically: true, encoding: .utf8)
+        var upstreamTLS = TLSConfiguration.makeClientConfiguration()
+        upstreamTLS.trustRoots = .certificates([try NIOSSLCertificate(bytes: Array(upstreamCA.rootCertificateDER), format: .der)])
+        let resolver = StaticTestResolver(address: "127.0.0.1")
+        let store = try SessionStore(path: directory.appendingPathComponent("sessions.sqlite").path)
+        let proxy = ProxyEngine(store: store, upstreamTLSConfiguration: upstreamTLS,
+                                trustedResolver: resolver, trustedDNSHosts: ["www.google.com.hk"])
+        await proxy.configureTLS(authority: proxyCA, includeHosts: ["www.google.com.hk"])
+        let proxyPort = try await proxy.start(port: 0)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--show-error", "--noproxy", "", "--proxy", "http://127.0.0.1:\(proxyPort)",
+                             "--cacert", rootURL.path, "https://www.google.com.hk:\(originPort)/fixture"]
+        let output = Pipe()
+        let errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let body = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        await proxy.stop()
+        try await origin.close().get()
+        try await originGroup.shutdownGracefully()
+        XCTAssertEqual(process.terminationStatus, 0, stderr ?? "")
+        XCTAssertEqual(body, "hello from origin")
+        let queried = await resolver.queriedHosts
+        XCTAssertEqual(queried, ["www.google.com.hk"])
+    }
+
     func testSelectedConnectHostIsDecryptedAndRecorded() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
         let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
@@ -616,5 +802,17 @@ private final class LargeBodyOriginHandler: ChannelInboundHandler, @unchecked Se
             context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
             context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
         }
+    }
+}
+
+private actor StaticTestResolver: TrustedHostResolving {
+    let address: String
+    private(set) var queriedHosts: [String] = []
+
+    init(address: String) { self.address = address }
+
+    func resolve(host: String) async throws -> String {
+        queriedHosts.append(host)
+        return address
     }
 }

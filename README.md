@@ -20,6 +20,8 @@ The proxy listens on `127.0.0.1:8888` by default. Click **Enable System Proxy** 
 
 For HTTPS inspection, open **Root Certificate…**, export the public certificate, and explicitly trust it for SSL in Keychain Access. Add the desired hostnames under **Proxy Settings**. The root private key stays in the local Keychain. Unlisted HTTPS hosts pass through without decryption. Certificate-pinned clients may reject interception.
 
+If a site fails because the local DNS server returns an unusable address, add its exact hostname under **Proxy Settings → Trusted DNS routing**. ProxyLab will resolve only those names through `https://dns.google/resolve` and connect to the returned public address while retaining the requested hostname for TLS and certificate validation. For example, add `www.google.com.hk` there when the local resolver returns a private address that resets TLS. This setting sends the listed hostnames to Google's DNS service; leave it empty to use system DNS for all traffic.
+
 macOS may request Keychain access the first time a locally signed build uses the CA, or after the app is rebuilt with a new ad-hoc signature. Grant access only when you are intentionally enabling HTTPS inspection.
 
 Sessions are stored in `~/Library/Application Support/ProxyLab/sessions.sqlite`. Only the first 10 MB of each request or response body is retained; larger traffic still passes through. Imported HAR records are viewable alongside captured requests.

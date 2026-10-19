@@ -10,21 +10,34 @@ public actor ProxyEngine {
     private let store: SessionStore
     private let group: MultiThreadedEventLoopGroup
     private let client: HTTPClient
+    private var routedClients: [String: HTTPClient] = [:]
+    private let upstreamTLSConfiguration: TLSConfiguration?
     private var listener: Channel?
     private var rules: [RewriteRule] = []
     private var certificateAuthority: CertificateAuthority?
     private var sslHosts: [String] = []
     private var recordingEnabled = true
+    private let connectAddressOverrides: [String: String]
+    private let trustedResolver: (any TrustedHostResolving)?
+    private var trustedDNSHosts: Set<String>
 
     public init(store: SessionStore, upstreamTLSConfiguration: TLSConfiguration? = nil,
-                breakpointCenter: BreakpointCenter = BreakpointCenter()) {
+                breakpointCenter: BreakpointCenter = BreakpointCenter(),
+                connectAddressOverrides: [String: String] = [:],
+                trustedResolver: (any TrustedHostResolving)? = nil,
+                trustedDNSHosts: Set<String> = []) {
         self.store = store
         self.breakpointCenter = breakpointCenter
+        self.connectAddressOverrides = connectAddressOverrides
+        self.trustedResolver = trustedResolver
+        self.trustedDNSHosts = Set(trustedDNSHosts.map { $0.lowercased() })
+        self.upstreamTLSConfiguration = upstreamTLSConfiguration
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
         var configuration = HTTPClient.Configuration(tlsConfiguration: upstreamTLSConfiguration,
                                                      redirectConfiguration: .disallow, proxy: nil,
                                                      decompression: .disabled)
         configuration.httpVersion = .http1Only
+        configuration.dnsOverride = connectAddressOverrides
         self.client = HTTPClient(eventLoopGroupProvider: .shared(group), configuration: configuration)
     }
 
@@ -49,6 +62,9 @@ public actor ProxyEngine {
             self.listener = nil
         }
         try? await client.shutdown().get()
+        for routedClient in routedClients.values { try? await routedClient.shutdown().get() }
+        routedClients.removeAll()
+        await trustedResolver?.shutdown()
         try? await group.shutdownGracefully()
     }
 
@@ -57,6 +73,10 @@ public actor ProxyEngine {
     }
 
     public func setRecordingEnabled(_ enabled: Bool) { recordingEnabled = enabled }
+
+    public func setTrustedDNSHosts(_ hosts: Set<String>) {
+        trustedDNSHosts = Set(hosts.map { $0.lowercased() })
+    }
 
     public func configureTLS(authority: CertificateAuthority, includeHosts: [String]) {
         certificateAuthority = authority
@@ -100,6 +120,25 @@ public actor ProxyEngine {
         if ["localhost", "127.0.0.1", "::1"].contains(host), listener?.localAddress?.port == port {
             throw ProxyRequestError.selfLoop
         }
+        let address = try await routeAddress(for: host)
+        let requestClient: HTTPClient
+        if let address {
+            let key = "\(host)|\(address)"
+            if let cached = routedClients[key] {
+                requestClient = cached
+            } else {
+                var configuration = HTTPClient.Configuration(tlsConfiguration: upstreamTLSConfiguration,
+                                                             redirectConfiguration: .disallow, proxy: nil,
+                                                             decompression: .disabled)
+                configuration.httpVersion = .http1Only
+                configuration.dnsOverride = [host: address]
+                let routed = HTTPClient(eventLoopGroupProvider: .shared(group), configuration: configuration)
+                routedClients[key] = routed
+                requestClient = routed
+            }
+        } else {
+            requestClient = client
+        }
         var outgoing = HTTPClientRequest(url: request.url)
         outgoing.method = HTTPMethod(rawValue: request.method)
         for header in request.headers where !Self.isHopByHop(header.name) && header.name.lowercased() != "content-length" {
@@ -111,7 +150,7 @@ public actor ProxyEngine {
         } else if !request.body.isEmpty {
             outgoing.body = .bytes(ByteBuffer(bytes: request.body))
         }
-        return try await client.execute(outgoing, timeout: .seconds(120))
+        return try await requestClient.execute(outgoing, timeout: .seconds(120))
     }
 
     func rewriteResponse(_ response: inout ProxyResponse, for request: ProxyRequest,
@@ -139,8 +178,18 @@ public actor ProxyEngine {
            listener?.localAddress?.port == authority.port {
             throw ProxyAuthorityError.invalid
         }
+        let host = authority.host.lowercased()
+        let address = try await routeAddress(for: host)
         return try await ClientBootstrap(group: group)
-            .connect(host: authority.host, port: authority.port).get()
+            .connectTimeout(.seconds(8))
+            .connect(host: address ?? authority.host, port: authority.port).get()
+    }
+
+    private func routeAddress(for host: String) async throws -> String? {
+        if let override = connectAddressOverrides[host] { return override }
+        guard trustedDNSHosts.contains(host) else { return nil }
+        guard let trustedResolver else { throw TrustedDNSResolutionError.providerFailure }
+        return try await trustedResolver.resolve(host: host)
     }
 
     static func isHopByHop(_ name: String) -> Bool {

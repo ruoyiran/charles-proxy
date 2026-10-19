@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var rewriteRules: [RewriteRule] = []
     @Published var breakpointRules: [BreakpointRule] = []
     @Published var sslHostsText = ""
+    @Published var trustedDNSHostsText = ""
     @Published var recordingEnabled = true
     @Published var systemProxyEnabled = false
     @Published var hasPendingRestore = false
@@ -39,6 +40,9 @@ final class AppModel: ObservableObject {
            let parsed = try? JSONDecoder().decode([BreakpointRule].self, from: rules) { breakpointRules = parsed }
         if let text = try? String(contentsOf: supportDirectory.appendingPathComponent("ssl-hosts.txt"), encoding: .utf8) {
             sslHostsText = text
+        }
+        if let text = try? String(contentsOf: supportDirectory.appendingPathComponent("trusted-dns-hosts.txt"), encoding: .utf8) {
+            trustedDNSHostsText = text
         }
     }
 
@@ -83,7 +87,8 @@ final class AppModel: ObservableObject {
     }
 
     private func startEngine(store: SessionStore) async throws {
-        let proxy = ProxyEngine(store: store)
+        let proxy = ProxyEngine(store: store, trustedResolver: GoogleHTTPSDNSResolver(),
+                                trustedDNSHosts: Set(trustedDNSHostPatterns))
         await proxy.setRules(rewriteRules)
         await proxy.breakpointCenter.setRules(breakpointRules)
         await proxy.setRecordingEnabled(recordingEnabled)
@@ -101,6 +106,12 @@ final class AppModel: ObservableObject {
     private var sslHostPatterns: [String] {
         sslHostsText.split(whereSeparator: { $0.isNewline || $0 == "," })
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private var trustedDNSHostPatterns: [String] {
+        trustedDNSHostsText.split(whereSeparator: { $0.isNewline || $0 == "," })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty }
     }
 
@@ -165,6 +176,15 @@ final class AppModel: ObservableObject {
                     await engine.configureTLS(authority: loaded, includeHosts: sslHostPatterns)
                 }
             }
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func updateTrustedDNSHosts(_ text: String) async {
+        trustedDNSHostsText = text
+        do {
+            try text.write(to: supportDirectory.appendingPathComponent("trusted-dns-hosts.txt"),
+                           atomically: true, encoding: .utf8)
+            await engine?.setTrustedDNSHosts(Set(trustedDNSHostPatterns))
         } catch { errorMessage = error.localizedDescription }
     }
 

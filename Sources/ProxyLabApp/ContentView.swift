@@ -95,7 +95,7 @@ struct ContentView: View {
         .sheet(isPresented: $showRewrite) { RewriteRulesView().environmentObject(model).frame(minWidth: 650, minHeight: 460) }
         .sheet(isPresented: $showBreakpointRules) { BreakpointRulesView().environmentObject(model).frame(minWidth: 540, minHeight: 380) }
         .sheet(isPresented: $showPending) { PendingBreakpointsView().environmentObject(model).frame(minWidth: 760, minHeight: 500) }
-        .sheet(isPresented: $showSettings) { ProxySettingsView().environmentObject(model).frame(minWidth: 540, minHeight: 440) }
+        .sheet(isPresented: $showSettings) { ProxySettingsView().environmentObject(model).frame(minWidth: 540, minHeight: 570) }
         .sheet(isPresented: $showCertificateGuide) { CertificateGuideView().environmentObject(model).frame(minWidth: 540, minHeight: 350) }
         .confirmationDialog("Clear all recorded requests?", isPresented: $confirmClearSession) {
             Button("Clear Session", role: .destructive) { Task { await model.clearSession() } }
@@ -236,6 +236,7 @@ private struct ProxySettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var hosts = ""
+    @State private var trustedDNSHosts = ""
     @State private var port = "8888"
 
     var body: some View {
@@ -247,6 +248,11 @@ private struct ProxySettingsView: View {
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $hosts).font(.system(.body, design: .monospaced))
                 .border(.separator).frame(height: 130)
+            Text("Trusted DNS routing").font(.headline)
+            Text("For hosts whose local DNS points to a blocked or incorrect address. One hostname per line. ProxyLab resolves these names through dns.google while keeping the original TLS hostname.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextEditor(text: $trustedDNSHosts).font(.system(.body, design: .monospaced))
+                .border(.separator).frame(height: 75)
             Text("Export and trust the local root certificate before inspecting HTTPS.")
                 .font(.caption).foregroundStyle(.secondary)
             Spacer()
@@ -256,6 +262,7 @@ private struct ProxySettingsView: View {
                 Button("Apply") {
                     Task {
                         await model.updateSSLHosts(hosts)
+                        await model.updateTrustedDNSHosts(trustedDNSHosts)
                         if let newPort = Int(port), (1...65535).contains(newPort), newPort != model.proxyPort {
                             await model.restart(port: newPort)
                         }
@@ -266,7 +273,11 @@ private struct ProxySettingsView: View {
             }
         }
         .padding(20)
-        .onAppear { hosts = model.sslHostsText; port = String(model.proxyPort) }
+        .onAppear {
+            hosts = model.sslHostsText
+            trustedDNSHosts = model.trustedDNSHostsText
+            port = String(model.proxyPort)
+        }
     }
 }
 
