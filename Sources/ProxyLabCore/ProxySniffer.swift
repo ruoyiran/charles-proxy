@@ -12,6 +12,7 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
     private let engine: ProxyEngine
     private var mode: Mode = .inspecting
     private var pending = Data()
+    private var tunnelTask: Task<Void, Never>?
 
     init(engine: ProxyEngine) { self.engine = engine }
 
@@ -43,15 +44,13 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
                 pending.removeSubrange(..<headerEnd.upperBound)
                 mode = .connecting
                 let channel = context.channel
-                Task { await establishTunnel(target: target, client: channel) }
+                tunnelTask = Task { await establishTunnel(target: target, client: channel) }
             } else {
                 mode = .configuringHTTP
                 let buffered = ByteBuffer(bytes: pending)
                 pending.removeAll(keepingCapacity: false)
                 let channel = context.channel
-                channel.pipeline.configureHTTPServerPipeline(withErrorHandling: true).flatMap {
-                    channel.pipeline.addHandler(ProxyHTTPHandler(engine: self.engine))
-                }.whenComplete { result in
+                HTTPProtocolPipeline.configureHTTP1(channel: channel, engine: engine).whenComplete { result in
                     switch result {
                     case .success:
                         self.mode = .http
@@ -71,17 +70,20 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
     }
 
     private func establishTunnel(target: String, client: Channel) async {
+        var upstream: Channel?
         do {
+            try Task.checkCancellation()
+            guard await engine.canForward(client) else { return }
             let authority = try ProxyAuthority(target)
             if let sslContext = try await engine.sslContext(for: authority.host) {
+                try Task.checkCancellation()
+                guard await engine.canForward(client) else { return }
                 try await client.writeAndFlush(ByteBuffer(string: "HTTP/1.1 200 Connection Established\r\n\r\n")).get()
                 try await client.eventLoop.submit {
                     try client.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: sslContext))
                 }.get()
-                try await client.pipeline.configureHTTPServerPipeline(withErrorHandling: true).get()
-                try await client.pipeline.addHandler(ProxyHTTPHandler(engine: engine,
-                                                                     tunnelAuthority: authority,
-                                                                     tlsIntercepted: true)).get()
+                try await HTTPProtocolPipeline.configureTLS(channel: client, engine: engine,
+                                                            tunnelAuthority: authority).get()
                 client.eventLoop.execute {
                     self.mode = .http
                     if !self.pending.isEmpty {
@@ -92,7 +94,10 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
                 }
                 return
             }
-            let remote = try await engine.connect(authority)
+            let remote = try await engine.connect(authority, clientChannel: client)
+            upstream = remote
+            try Task.checkCancellation()
+            guard await engine.canForward(client) else { try? await remote.close().get(); return }
             try await remote.pipeline.addHandler(RawRelayHandler(peer: client)).get()
             try await client.pipeline.addHandler(RawRelayHandler(peer: remote)).get()
             try await client.writeAndFlush(ByteBuffer(string: "HTTP/1.1 200 Connection Established\r\n\r\n")).get()
@@ -100,7 +105,7 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
             await engine.save(CapturedTransaction(
                 startedAt: Date(), endedAt: Date(),
                 request: ProxyRequest(method: "CONNECT", url: "https://\(host):\(authority.port)"),
-                response: ProxyResponse(status: 200)
+                response: ProxyResponse(status: 200), clientAddress: client.remoteAddress?.ipAddress
             ))
             client.eventLoop.execute {
                 self.mode = .tunnel
@@ -111,6 +116,7 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
                 }
             }
         } catch {
+            if let upstream { try? await upstream.close().get() }
             let message = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             try? await client.writeAndFlush(ByteBuffer(string: message)).get()
             try? await client.close().get()
@@ -119,6 +125,12 @@ final class ProxySniffer: ChannelInboundHandler, @unchecked Sendable {
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         context.close(promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        tunnelTask?.cancel()
+        tunnelTask = nil
+        context.fireChannelInactive()
     }
 }
 

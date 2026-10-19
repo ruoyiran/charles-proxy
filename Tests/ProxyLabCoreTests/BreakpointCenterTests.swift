@@ -2,6 +2,18 @@ import XCTest
 @testable import ProxyLabCore
 
 final class BreakpointCenterTests: XCTestCase {
+    func testCancelledClientRemovesItsPausedRequestImmediately() async throws {
+        let center = BreakpointCenter()
+        await center.setRules([BreakpointRule(match: RuleMatch(host: "example.com"), phase: .request)])
+        let request = ProxyRequest(method: "GET", url: "http://example.com/")
+        let waiter = Task { await center.intercept(request: request, response: nil, phase: .request) }
+        _ = try await waitForPending(center)
+        waiter.cancel()
+        let result = await waiter.value
+        if case .cancel = result {} else { XCTFail("Cancelled client must not execute") }
+        let remaining = await center.pending()
+        XCTAssertTrue(remaining.isEmpty)
+    }
     func testRequestWaitsForExplicitEditedDecision() async throws {
         let center = BreakpointCenter()
         await center.setRules([BreakpointRule(match: RuleMatch(host: "example.com", path: "/*"), phase: .request)])

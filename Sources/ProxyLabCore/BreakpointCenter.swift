@@ -52,16 +52,22 @@ public actor BreakpointCenter {
         guard shouldIntercept(request: request, phase: phase) else {
             return .cancel
         }
+        guard !Task.isCancelled else { return .cancel }
         let id = UUID()
         let item = PendingBreakpoint(id: id, createdAt: Date(), phase: phase,
                                      request: request, response: response, bodyTruncated: bodyTruncated)
-        return await withCheckedContinuation { continuation in
-            items[id] = item
-            waiting[id] = continuation
-            Task {
-                try? await Task.sleep(for: timeout)
-                self.resolve(id: id, decision: .cancel)
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled else { continuation.resume(returning: .cancel); return }
+                items[id] = item
+                waiting[id] = continuation
+                Task {
+                    try? await Task.sleep(for: timeout)
+                    self.resolve(id: id, decision: .cancel)
+                }
             }
+        } onCancel: {
+            Task { await self.resolve(id: id, decision: .cancel) }
         }
     }
 

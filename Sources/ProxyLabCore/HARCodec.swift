@@ -10,7 +10,7 @@ public enum HARCodec {
             let request = transaction.request
             let response = transaction.response
             var requestObject: [String: Any] = [
-                "method": request.method, "url": request.url, "httpVersion": "HTTP/1.1",
+                "method": request.method, "url": request.url, "httpVersion": transaction.requestHTTPVersion ?? "HTTP/1.1",
                 "headers": headerObjects(request.headers), "queryString": queryObjects(request.url),
                 "cookies": [], "headersSize": -1, "bodySize": request.body.count,
             ]
@@ -20,7 +20,7 @@ public enum HARCodec {
             let responseBody = response?.body ?? Data()
             let responseObject: [String: Any] = [
                 "status": response?.status ?? 0, "statusText": HTTPURLResponse.localizedString(forStatusCode: response?.status ?? 0),
-                "httpVersion": "HTTP/1.1", "headers": headerObjects(response?.headers ?? []),
+                "httpVersion": transaction.responseHTTPVersion ?? "HTTP/1.1", "headers": headerObjects(response?.headers ?? []),
                 "cookies": [], "content": contentObject(responseBody, mimeType: response?.header("Content-Type") ?? "application/octet-stream"),
                 "redirectURL": response?.header("Location") ?? "", "headersSize": -1, "bodySize": responseBody.count,
             ]
@@ -33,6 +33,11 @@ public enum HARCodec {
             if transaction.requestBodyTruncated || transaction.responseBodyTruncated {
                 entry["comment"] = "ProxyLab retained only the first 10 MB of one or more bodies"
             }
+            entry["_proxylabRequestBodyTruncated"] = transaction.requestBodyTruncated
+            entry["_proxylabResponseBodyTruncated"] = transaction.responseBodyTruncated
+            if let address = transaction.clientAddress { entry["_proxylabClientAddress"] = address }
+            if let id = transaction.replayOf { entry["_proxylabReplayOf"] = id.uuidString }
+            if let trailers = transaction.responseTrailers { entry["_proxylabResponseTrailers"] = headerObjects(trailers) }
             return entry
         }
         return try JSONSerialization.data(withJSONObject: ["log": [
@@ -64,8 +69,16 @@ public enum HARCodec {
                 ProxyResponse(status: $0["status"] as? Int ?? 0,
                               headers: decodeHeaders($0["headers"]), body: responseBody)
             }
+            let legacyTruncation = (entry["comment"] as? String) == "ProxyLab retained only the first 10 MB of one or more bodies"
             return CapturedTransaction(startedAt: start, endedAt: start.addingTimeInterval(elapsed),
-                                       request: parsedRequest, response: parsedResponse)
+                                       request: parsedRequest, response: parsedResponse,
+                                       requestBodyTruncated: entry["_proxylabRequestBodyTruncated"] as? Bool ?? legacyTruncation,
+                                       responseBodyTruncated: entry["_proxylabResponseBodyTruncated"] as? Bool ?? legacyTruncation,
+                                       clientAddress: entry["_proxylabClientAddress"] as? String,
+                                       requestHTTPVersion: request["httpVersion"] as? String,
+                                       responseHTTPVersion: response?["httpVersion"] as? String,
+                                       replayOf: (entry["_proxylabReplayOf"] as? String).flatMap(UUID.init(uuidString:)),
+                                       responseTrailers: entry["_proxylabResponseTrailers"].map(decodeHeaders))
         }
     }
 

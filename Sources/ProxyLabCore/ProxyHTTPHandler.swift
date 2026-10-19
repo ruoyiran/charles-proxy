@@ -3,24 +3,30 @@ import AsyncHTTPClient
 import NIOCore
 import NIOHTTP1
 
-final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
+final class ProxyHTTPHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
     private let engine: ProxyEngine
     private let tunnelAuthority: ProxyAuthority?
     private let tlsIntercepted: Bool
+    private let clientChannel: Channel?
+    private let requestHTTPVersion: String?
     private var currentHead: HTTPRequestHead?
     private var currentBody = Data()
     private var currentBodyFile: URL?
     private var currentBodyHandle: FileHandle?
     private var currentBodyLength = 0
     private static let captureLimit = 10 * 1_024 * 1_024
+    private var requests: [UUID: Task<Void, Never>] = [:]
 
-    init(engine: ProxyEngine, tunnelAuthority: ProxyAuthority? = nil, tlsIntercepted: Bool = false) {
+    init(engine: ProxyEngine, tunnelAuthority: ProxyAuthority? = nil, tlsIntercepted: Bool = false,
+         clientChannel: Channel? = nil, requestHTTPVersion: String? = nil) {
         self.engine = engine
         self.tunnelAuthority = tunnelAuthority
         self.tlsIntercepted = tlsIntercepted
+        self.clientChannel = clientChannel
+        self.requestHTTPVersion = requestHTTPVersion
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -70,16 +76,36 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             let url = Self.absoluteURL(head, tunnelAuthority: tunnelAuthority)
             let request = ProxyRequest(method: head.method.rawValue, url: url, headers: headers, body: body)
             let channel = context.channel
-            Task { await handle(request, on: channel, bodyFile: bodyFile, bodyLength: bodyLength) }
+            let version = requestHTTPVersion ?? ProxyEngine.versionLabel(head.version)
+            let id = UUID()
+            requests[id] = Task {
+                await handle(request, on: channel, bodyFile: bodyFile, bodyLength: bodyLength, version: version)
+                if !Task.isCancelled { channel.eventLoop.execute { self.requests.removeValue(forKey: id) } }
+            }
         }
     }
 
-    private func handle(_ original: ProxyRequest, on channel: Channel, bodyFile: URL?, bodyLength: Int) async {
+    private func handle(_ original: ProxyRequest, on channel: Channel, bodyFile: URL?, bodyLength: Int, version: String) async {
         defer { if let bodyFile { try? FileManager.default.removeItem(at: bodyFile) } }
+        let physical = clientChannel ?? channel
+        guard !Task.isCancelled, await engine.canForward(physical) else { return }
+        if let local = await engine.mobileSetupResponse(for: original) {
+            var headers = [HTTPHeader(name: "Content-Type", value: local.contentType),
+                           HTTPHeader(name: "Cache-Control", value: "no-store"),
+                           HTTPHeader(name: "X-Content-Type-Options", value: "nosniff")]
+            if let name = local.downloadName { headers.append(HTTPHeader(name: "Content-Disposition", value: "attachment; filename=\"\(name)\"")) }
+            _ = try? await sendHead(status: local.status, headers: headers, bodyLength: local.body.count,
+                                   requestMethod: original.method, on: channel)
+            if original.method != "HEAD" { try? await sendBody(ByteBuffer(bytes: local.body), on: channel) }
+            try? await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+            if original.header("Connection")?.lowercased() == "close" { try? await channel.close().get() }
+            return
+        }
         let requestTruncated = bodyFile != nil
         var request = await engine.prepare(original, allowBodyChanges: !requestTruncated)
         var transaction = CapturedTransaction(request: request, tlsIntercepted: tlsIntercepted,
-                                              requestBodyTruncated: requestTruncated)
+                                              requestBodyTruncated: requestTruncated, clientAddress: physical.remoteAddress?.ipAddress,
+                                              requestHTTPVersion: version)
         var didWriteResponseHead = false
         var completedResponse = false
         do {
@@ -91,7 +117,12 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             case .abort: throw ProxyInterceptionError.aborted
             }
             transaction.request = request
-            let response = try await engine.execute(request, bodyFile: bodyFile, bodyLength: bodyLength)
+            try Task.checkCancellation()
+            guard await engine.canForward(physical) else { return }
+            let response = try await engine.execute(request, bodyFile: bodyFile, bodyLength: bodyLength, clientChannel: physical)
+            transaction.responseHTTPVersion = ProxyEngine.versionLabel(response.version)
+            // HTTP/2 may append trailers even when its response advertises a content length.
+            let mayHaveStreamingTrailers = requestHTTPVersion != "HTTP/2" && response.version.major == 2
             let status = Int(response.status.code)
             let upstreamHeaders = response.headers.map { HTTPHeader(name: $0.name, value: $0.value) }
                 .filter { !ProxyEngine.isHopByHop($0.name) }
@@ -112,7 +143,8 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 var headOnly = ProxyResponse(status: status, headers: upstreamHeaders)
                 await engine.rewriteResponse(&headOnly, for: request, allowBodyChanges: false)
                 outgoingHeaders = try await sendHead(status: headOnly.status, headers: headOnly.headers,
-                                                     bodyLength: nil, requestMethod: request.method, on: channel)
+                                                     bodyLength: nil, requestMethod: request.method, on: channel,
+                                                     mayHaveTrailers: mayHaveStreamingTrailers)
                 didWriteResponseHead = true
             }
             for try await chunk in response.body {
@@ -128,7 +160,8 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     await engine.rewriteResponse(&headOnly, for: request, allowBodyChanges: false)
                     if !hasResponseBreakpoint {
                         outgoingHeaders = try await sendHead(status: headOnly.status, headers: headOnly.headers,
-                                                             bodyLength: nil, requestMethod: request.method, on: channel)
+                                                             bodyLength: nil, requestMethod: request.method, on: channel,
+                                                             mayHaveTrailers: mayHaveStreamingTrailers)
                         didWriteResponseHead = true
                     } else {
                         let path = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -162,8 +195,11 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                     try await sendBody(chunk, on: channel)
                 }
             }
+            // AHC publishes trailers only after the body sequence has completed.
+            let responseTrailers = response.body.trailers
+            transaction.responseTrailers = responseTrailers?.map { HTTPHeader(name: $0.name, value: $0.value) }
             if streaming && !hasResponseBreakpoint {
-                try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+                try await channel.writeAndFlush(HTTPServerResponsePart.end(responseTrailers)).get()
                 completedResponse = true
                 transaction.response = ProxyResponse(status: status, headers: outgoingHeaders, body: capture)
                 transaction.responseBodyTruncated = bytesReceived > capture.count
@@ -186,7 +222,8 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 var headOnly = ProxyResponse(status: preview.status, headers: preview.headers)
                 await engine.rewriteResponse(&headOnly, for: request, allowBodyChanges: false)
                 outgoingHeaders = try await sendHead(status: headOnly.status, headers: headOnly.headers,
-                                                     bodyLength: bytesReceived, requestMethod: request.method, on: channel)
+                                                     bodyLength: bytesReceived, requestMethod: request.method, on: channel,
+                                                     responseTrailers: responseTrailers)
                 didWriteResponseHead = true
                 if let largeBodyURL {
                     let reader = try FileHandle(forReadingFrom: largeBodyURL)
@@ -197,7 +234,7 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                         try await sendBody(ByteBuffer(bytes: data), on: channel)
                     }
                 }
-                try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+                try await channel.writeAndFlush(HTTPServerResponsePart.end(responseTrailers)).get()
                 completedResponse = true
                 preview.body = capture
                 transaction.response = preview
@@ -214,10 +251,10 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
                 }
                 outgoingHeaders = try await sendHead(status: editable.status, headers: editable.headers,
                                                      bodyLength: editable.body.count, requestMethod: request.method,
-                                                     on: channel)
+                                                     on: channel, responseTrailers: responseTrailers)
                 didWriteResponseHead = true
                 if !editable.body.isEmpty { try await sendBody(ByteBuffer(bytes: editable.body), on: channel) }
-                try await channel.writeAndFlush(HTTPServerResponsePart.end(nil)).get()
+                try await channel.writeAndFlush(HTTPServerResponsePart.end(responseTrailers)).get()
                 completedResponse = true
                 transaction.response = ProxyResponse(status: editable.status, headers: outgoingHeaders,
                                                      body: editable.body.prefix(Self.captureLimit))
@@ -225,7 +262,9 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
             }
         } catch {
             transaction.error = String(describing: error)
-            if completedResponse {
+            if Task.isCancelled || !channel.isActive {
+                // The client disconnected or its access was revoked.
+            } else if completedResponse {
                 // A complete response has already been sent; retain only the session error.
             } else if didWriteResponseHead {
                 try? await channel.close().get()
@@ -243,13 +282,19 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
     }
 
     private func sendHead(status: Int, headers: [HTTPHeader], bodyLength: Int?, requestMethod: String,
-                          on channel: Channel) async throws -> [HTTPHeader] {
+                          on channel: Channel, responseTrailers: HTTPHeaders? = nil,
+                          mayHaveTrailers: Bool = false) async throws -> [HTTPHeader] {
         var result = headers.filter { !ProxyEngine.isHopByHop($0.name) }
         let bodyAllowed = requestMethod.uppercased() != "HEAD" && status != 204 && status != 304 && status >= 200
-        if let bodyLength {
+        let needsChunkedTrailers = requestHTTPVersion != "HTTP/2" && bodyAllowed &&
+            (mayHaveTrailers || responseTrailers?.isEmpty == false)
+        if needsChunkedTrailers {
+            result.removeAll { $0.name.caseInsensitiveCompare("Content-Length") == .orderedSame }
+            result.append(HTTPHeader(name: "Transfer-Encoding", value: "chunked"))
+        } else if let bodyLength {
             result.removeAll { $0.name.caseInsensitiveCompare("Content-Length") == .orderedSame }
             result.append(HTTPHeader(name: "Content-Length", value: String(bodyLength)))
-        } else if bodyAllowed && !result.contains(where: { $0.name.caseInsensitiveCompare("Content-Length") == .orderedSame }) {
+        } else if bodyAllowed && requestHTTPVersion != "HTTP/2" && !result.contains(where: { $0.name.caseInsensitiveCompare("Content-Length") == .orderedSame }) {
             result.append(HTTPHeader(name: "Transfer-Encoding", value: "chunked"))
         }
         var nioHeaders = HTTPHeaders()
@@ -275,6 +320,14 @@ final class ProxyHTTPHandler: ChannelInboundHandler, @unchecked Sendable {
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         context.close(promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        for task in requests.values { task.cancel() }
+        requests.removeAll()
+        try? currentBodyHandle?.close()
+        if let currentBodyFile { try? FileManager.default.removeItem(at: currentBodyFile) }
+        context.fireChannelInactive()
     }
 }
 

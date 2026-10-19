@@ -10,7 +10,11 @@ public actor CertificateAuthority {
     public nonisolated let rootCertificateDER: Data
     private let root: Certificate
     private let privateKey: P256.Signing.PrivateKey
-    private var cache: [String: (Data, NIOSSLContext)] = [:]
+    private struct ContextKey: Hashable {
+        let host: String
+        let applicationProtocols: [String]
+    }
+    private var cache: [ContextKey: (Data, NIOSSLContext)] = [:]
 
     public init(persistentDirectory: URL?) throws {
         let key: P256.Signing.PrivateKey
@@ -47,17 +51,18 @@ public actor CertificateAuthority {
         try issue(for: host).0
     }
 
-    public func serverContext(for host: String) throws -> NIOSSLContext {
-        try issue(for: host).1
+    public func serverContext(for host: String, applicationProtocols: [String] = ["h2", "http/1.1"]) throws -> NIOSSLContext {
+        try issue(for: host, applicationProtocols: applicationProtocols).1
     }
 
-    private func issue(for host: String) throws -> (Data, NIOSSLContext) {
+    private func issue(for host: String, applicationProtocols: [String] = ["h2", "http/1.1"]) throws -> (Data, NIOSSLContext) {
         let canonicalHost = host.lowercased()
         guard !canonicalHost.isEmpty, canonicalHost.count <= 253,
               !canonicalHost.contains(where: { $0.isWhitespace || $0 == "/" || $0 == "\\" }) else {
             throw CertificateAuthorityError.invalidHost
         }
-        if let cached = cache[canonicalHost] { return cached }
+        let cacheKey = ContextKey(host: canonicalHost, applicationProtocols: applicationProtocols)
+        if let cached = cache[cacheKey] { return cached }
         let leafKey = P256.Signing.PrivateKey()
         let name = try DistinguishedName { CommonName(canonicalHost) }
         let now = Date()
@@ -86,9 +91,9 @@ public actor CertificateAuthority {
         var configuration = TLSConfiguration.makeServerConfiguration(
             certificateChain: [.certificate(cert), .certificate(rootCert)], privateKey: .privateKey(key)
         )
-        configuration.applicationProtocols = ["http/1.1"]
+        configuration.applicationProtocols = applicationProtocols
         let result = (Data(try cert.toDERBytes()), try NIOSSLContext(configuration: configuration))
-        cache[canonicalHost] = result
+        cache[cacheKey] = result
         return result
     }
 

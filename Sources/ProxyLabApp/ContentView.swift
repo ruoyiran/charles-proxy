@@ -10,8 +10,12 @@ struct ContentView: View {
     @State private var showPending = false
     @State private var showSettings = false
     @State private var showCertificateGuide = false
+    @State private var showMobileSetup = false
     @State private var confirmClearSession = false
     @State private var requestToDelete: UUID?
+    @State private var showCaptureSettings = false
+    @State private var showComposer = false
+    @State private var composeTransaction: CapturedTransaction?
 
     private var filtered: [TransactionSummary] {
         guard !search.isEmpty else { return model.summaries }
@@ -35,6 +39,23 @@ struct ContentView: View {
                     .textFieldStyle(.roundedBorder)
                     .padding(.horizontal, 10)
                     .padding(.bottom, 8)
+                Picker("Device", selection: Binding(
+                    get: { model.selectedDeviceAddress ?? "" },
+                    set: { address in Task { await model.filterDevice(address.isEmpty ? nil : address) } }
+                )) {
+                    Text("All devices").tag("")
+                    ForEach(Array(Set(model.recordedDeviceAddresses + model.mobileDevices.map(\.address))).sorted(), id: \.self) { address in
+                        Text(MobileAccess.isLoopback(address) ? "This Mac (\(address))" : address).tag(address)
+                    }
+                }
+                .padding(.horizontal, 12).padding(.bottom, 8)
+                if model.focusPolicy.enabled {
+                    HStack {
+                        Label("Focus", systemImage: "scope").font(.caption).foregroundStyle(.purple)
+                        Spacer()
+                        Button("Show All") { var policy = model.focusPolicy; policy.enabled = false; Task { await model.saveFocusPolicy(policy) } }
+                    }.padding(.horizontal, 12).padding(.bottom, 6)
+                }
                 HStack {
                     Text("\(filtered.count) requests").font(.caption).foregroundStyle(.secondary)
                     Spacer()
@@ -100,6 +121,9 @@ struct ContentView: View {
                 Button { showBreakpointRules = true } label: { Label("Breakpoints", systemImage: "pause.circle") }
                 Button { showSettings = true } label: { Label("Settings", systemImage: "gearshape") }
                 Button { showCertificateGuide = true } label: { Label("HTTPS Setup", systemImage: "lock.shield") }
+                Button { showMobileSetup = true } label: { Label("Mobile Setup", systemImage: "iphone") }
+                Button { composeTransaction = nil; showComposer = true } label: { Label("Compose", systemImage: "square.and.pencil") }
+                Button { showCaptureSettings = true } label: { Label("Recording Filters", systemImage: "line.3.horizontal.decrease.circle") }
                 Menu {
                     Button("Import HAR…") { Task { await model.importHAR() } }
                     Button("Export HAR…") { Task { await model.exportHAR() } }
@@ -114,6 +138,9 @@ struct ContentView: View {
         .sheet(isPresented: $showPending) { PendingBreakpointsView().environmentObject(model).frame(minWidth: 760, minHeight: 500) }
         .sheet(isPresented: $showSettings) { ProxySettingsView().environmentObject(model).frame(minWidth: 540, minHeight: 430) }
         .sheet(isPresented: $showCertificateGuide) { CertificateGuideView().environmentObject(model).frame(minWidth: 600, minHeight: 400) }
+        .sheet(isPresented: $showMobileSetup) { MobileSetupView().environmentObject(model).frame(width: 700, height: 700) }
+        .sheet(isPresented: $showComposer) { RequestComposerView(transaction: composeTransaction).environmentObject(model) }
+        .sheet(isPresented: $showCaptureSettings) { CaptureSettingsView().environmentObject(model) }
         .confirmationDialog("Clear all recorded requests?", isPresented: $confirmClearSession) {
             Button("Clear Session", role: .destructive) { Task { await model.clearSession() } }
         } message: {
@@ -137,6 +164,9 @@ struct ContentView: View {
         } message: { Text(model.errorMessage ?? "") }
         .onChange(of: model.pendingBreakpoints.count) { old, new in
             if new > old && new > 0 { showPending = true }
+        }
+        .onChange(of: model.mobileDevices.filter { $0.access == .pending }.count) { old, new in
+            if new > old { showMobileSetup = true }
         }
         .overlay(alignment: .top) {
             if model.hasPendingRestore && !model.systemProxyEnabled {
@@ -162,6 +192,10 @@ struct ContentView: View {
                     Text(URL(string: item.url)?.path.isEmpty == false ? (URL(string: item.url)?.path ?? item.url) : item.url)
                         .lineLimit(1)
                     Text(item.host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    if let address = item.clientAddress, !MobileAccess.isLoopback(address) {
+                        Text(address).font(.caption2).foregroundStyle(.secondary)
+                    }
+                    if let version = item.requestHTTPVersion { Text(version).font(.caption2).foregroundStyle(.secondary) }
                 }
                 Spacer(minLength: 4)
                 StatusBadge(status: item.status)
@@ -172,6 +206,16 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .listRowBackground(model.selectedID == item.id ? Color.accentColor.opacity(0.16) : Color.clear)
         .contextMenu {
+            Button("Repeat Request") { Task { await model.replayRequest(item.id) } }.disabled(model.sendingRequest || item.method == "CONNECT")
+            Button("Edit and Send…") {
+                Task { await model.select(item.id); composeTransaction = model.selectedTransaction; showComposer = true }
+            }.disabled(item.method == "CONNECT")
+            Button("Focus This Host") { Task { await model.focusHost(item.host) } }
+            Button("Exclude This Host from Recording") {
+                var policy = model.capturePolicy; policy.exclude.append(.init(match: .init(host: item.host)))
+                Task { await model.saveCapturePolicy(policy) }
+            }
+            Divider()
             Button("Delete Request", role: .destructive) { requestToDelete = item.id }
             Button("Clear All Requests", role: .destructive) { confirmClearSession = true }
         }

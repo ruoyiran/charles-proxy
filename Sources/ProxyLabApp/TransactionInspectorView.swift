@@ -5,6 +5,7 @@ import ProxyLabCore
 struct TransactionInspectorView: View {
     let transaction: CapturedTransaction
     let showCertificateGuide: () -> Void
+    @EnvironmentObject private var model: AppModel
     @State private var selectedTab = InspectorTab.overview
 
     private enum InspectorTab: String, CaseIterable {
@@ -13,6 +14,7 @@ struct TransactionInspectorView: View {
         case requestBody = "Request Body"
         case responseHeaders = "Response Headers"
         case responseBody = "Response Body"
+        case webSocket = "WebSocket"
     }
 
     private var isTunnel: Bool { transaction.request.method.uppercased() == "CONNECT" }
@@ -46,7 +48,7 @@ struct TransactionInspectorView: View {
                 .background(Color.orange.opacity(0.1))
             }
             Picker("Inspector", selection: $selectedTab) {
-                ForEach(InspectorTab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                ForEach(InspectorTab.allCases.filter { $0 != .webSocket || transaction.response?.status == 101 || selectedTab == .webSocket }, id: \.self) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented).labelsHidden().padding(12)
             Group {
@@ -55,7 +57,7 @@ struct TransactionInspectorView: View {
                 case .requestHeaders:
                     HeadersInspector(headers: transaction.request.headers)
                 case .responseHeaders:
-                    HeadersInspector(headers: transaction.response?.headers ?? [])
+                    HeadersInspector(headers: (transaction.response?.headers ?? []) + (transaction.responseTrailers ?? []))
                 case .requestBody:
                     BodyInspector(data: transaction.request.body,
                                   contentType: transaction.request.header("Content-Type"),
@@ -69,6 +71,12 @@ struct TransactionInspectorView: View {
                                   truncated: transaction.responseBodyTruncated,
                                   suggestedName: "response-body", emptyMessage: isTunnel ? "HTTPS content has not been decrypted." : "This response has no body.",
                                   supportsPreview: true, responseURL: transaction.request.url)
+                case .webSocket:
+                    if transaction.response?.status == 101 {
+                        WebSocketMessagesView(page: model.webSocketPage)
+                    } else {
+                        ContentUnavailableView("This request is not a WebSocket", systemImage: "network")
+                    }
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -81,6 +89,10 @@ struct TransactionInspectorView: View {
             VStack(alignment: .leading, spacing: 14) {
                 property("URL", transaction.request.url)
                 property("Method", transaction.request.method)
+                if let version = transaction.requestHTTPVersion { property("Client HTTP version", version) }
+                if let version = transaction.responseHTTPVersion { property("Upstream HTTP version", version) }
+                if let id = transaction.replayOf { property("Replayed from", id.uuidString) }
+                if let address = transaction.clientAddress { property("Client device", address) }
                 property("Request body retained", "\(transaction.request.body.count) bytes\(transaction.requestBodyTruncated ? " — truncated at 10 MB" : "")")
                 property("Response body retained", "\(transaction.response?.body.count ?? 0) bytes\(transaction.responseBodyTruncated ? " — truncated at 10 MB" : "")")
                 if let error = transaction.error { property("Error", error) }

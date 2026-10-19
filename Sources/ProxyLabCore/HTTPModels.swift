@@ -65,12 +65,18 @@ public struct CapturedTransaction: Codable, Identifiable, Sendable {
     public var tlsIntercepted: Bool
     public var requestBodyTruncated: Bool
     public var responseBodyTruncated: Bool
+    public var clientAddress: String?
+    public var requestHTTPVersion: String?
+    public var responseHTTPVersion: String?
+    public var responseTrailers: [HTTPHeader]?
+    public var replayOf: UUID?
 
     public init(
         id: UUID = UUID(), startedAt: Date = Date(), endedAt: Date? = nil,
         request: ProxyRequest, response: ProxyResponse? = nil, error: String? = nil,
         tlsIntercepted: Bool = false, requestBodyTruncated: Bool = false,
-        responseBodyTruncated: Bool = false
+        responseBodyTruncated: Bool = false, clientAddress: String? = nil,
+        requestHTTPVersion: String? = nil, responseHTTPVersion: String? = nil, replayOf: UUID? = nil, responseTrailers: [HTTPHeader]? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -81,6 +87,11 @@ public struct CapturedTransaction: Codable, Identifiable, Sendable {
         self.tlsIntercepted = tlsIntercepted
         self.requestBodyTruncated = requestBodyTruncated
         self.responseBodyTruncated = responseBodyTruncated
+        self.clientAddress = clientAddress
+        self.requestHTTPVersion = requestHTTPVersion
+        self.responseHTTPVersion = responseHTTPVersion
+        self.responseTrailers = responseTrailers
+        self.replayOf = replayOf
     }
 }
 
@@ -91,13 +102,20 @@ public struct TransactionSummary: Identifiable, Sendable {
     public let method: String
     public let url: String
     public let status: Int?
+    public let clientAddress: String?
+    public let requestHTTPVersion: String?
+    public let replayOf: UUID?
 
-    public init(id: UUID, startedAt: Date, host: String, method: String, url: String, status: Int?) {
+    public init(id: UUID, startedAt: Date, host: String, method: String, url: String, status: Int?, clientAddress: String? = nil,
+                requestHTTPVersion: String? = nil, replayOf: UUID? = nil) {
         self.id = id
         self.startedAt = startedAt
         self.host = host
         self.method = method
         self.url = url
         self.status = status
+        self.clientAddress = clientAddress
+        self.requestHTTPVersion = requestHTTPVersion
+        self.replayOf = replayOf
     }
 }

@@ -16,6 +16,19 @@ final class AppModel: ObservableObject {
     @Published var recordingEnabled = true
     @Published var systemProxyEnabled = false
     @Published var hasPendingRestore = false
+    @Published var mobileConnectionsEnabled = false
+    @Published var mobileSetupInProgress = false
+    @Published var mobileDevices: [MobileDevice] = []
+    @Published var lanAddresses: [LANAddress] = []
+    @Published var selectedDeviceAddress: String?
+    @Published var recordedDeviceAddresses: [String] = []
+    @Published var capturePolicy = CapturePolicy()
+    @Published var focusPolicy = FocusPolicy()
+    @Published var sendingRequest = false
+    @Published var webSocketMessages: [WebSocketMessage] = []
+    @Published var webSocketPage = WebSocketMessagePage.empty
+    private var webSocketStore: WebSocketMessageStore?
+    private var sendTask: Task<CapturedTransaction, Error>?
     @Published var proxyPort = 8888
     @Published var statusText = "Starting proxy…"
     @Published var proxyUnavailable = false
@@ -56,6 +69,10 @@ final class AppModel: ObservableObject {
         if let text = try? String(contentsOf: supportDirectory.appendingPathComponent("trusted-dns-hosts.txt"), encoding: .utf8) {
             trustedDNSHostsText = text
         }
+        if let data = try? Data(contentsOf: supportDirectory.appendingPathComponent("capture-policy.json")),
+           let parsed = try? JSONDecoder().decode(CapturePolicy.self, from: data) { capturePolicy = parsed }
+        if let data = try? Data(contentsOf: supportDirectory.appendingPathComponent("focus-policy.json")),
+           let parsed = try? JSONDecoder().decode(FocusPolicy.self, from: data) { focusPolicy = parsed }
     }
 
     func start() async {
@@ -68,6 +85,7 @@ final class AppModel: ObservableObject {
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: supportDirectory.path)
             let openedStore = try SessionStore(path: supportDirectory.appendingPathComponent("sessions.sqlite").path)
             store = openedStore
+            webSocketStore = try WebSocketMessageStore(path: openedStore.path)
             refreshTask = Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refresh()
@@ -116,11 +134,13 @@ final class AppModel: ObservableObject {
         await proxy.setRules(rewriteRules)
         await proxy.breakpointCenter.setRules(breakpointRules)
         await proxy.setRecordingEnabled(recordingEnabled)
+        await proxy.setCapturePolicy(capturePolicy)
         await proxy.configureTLS(authority: authority)
+        if mobileConnectionsEnabled { try await proxy.setMobileConnectionsEnabled(true) }
         do {
             proxyPort = try await proxy.start(port: proxyPort)
             engine = proxy
-            statusText = "Listening on 127.0.0.1:\(proxyPort)"
+            updateListenerStatus()
         } catch {
             await proxy.stop()
             throw error
@@ -135,19 +155,67 @@ final class AppModel: ObservableObject {
 
     func refresh() async {
         hasPendingRestore = proxySettings.hasPendingRestore
+        lanAddresses = LANAddress.available()
         if let store {
-            do { summaries = try await store.listSummaries(limit: 1_000) }
+            do {
+                summaries = try await store.listSummaries(limit: 1_000, clientAddress: selectedDeviceAddress, focus: focusPolicy)
+                recordedDeviceAddresses = try await store.clientAddresses()
+            }
             catch { errorMessage = error.localizedDescription }
         }
-        if let engine { pendingBreakpoints = await engine.breakpointCenter.pending() }
+        if let engine {
+            pendingBreakpoints = await engine.breakpointCenter.pending()
+            mobileDevices = await engine.mobileAccess.listDevices()
+        }
+        if let id = selectedID, selectedTransaction?.response?.status == 101 {
+            let page = (try? await webSocketStore?.recent(transactionID: id)) ?? .empty
+            if selectedID == id { webSocketPage = page; webSocketMessages = page.messages }
+        }
+    }
+
+    func setMobileConnectionsEnabled(_ enabled: Bool) async {
+        guard !mobileSetupInProgress, let engine else {
+            if engine == nil { errorMessage = "Start the proxy before enabling mobile connections." }
+            return
+        }
+        mobileSetupInProgress = true
+        defer { mobileSetupInProgress = false }
+        do {
+            try await engine.setMobileConnectionsEnabled(enabled)
+            mobileConnectionsEnabled = enabled
+            updateListenerStatus()
+            await refresh()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func updateListenerStatus() {
+        statusText = mobileConnectionsEnabled ? "Listening on LAN:\(proxyPort) · device approval required" : "Listening on 127.0.0.1:\(proxyPort)"
+    }
+
+    func setDeviceAccess(_ access: DeviceAccess, address: String) async {
+        await engine?.setDeviceAccess(access, address: address)
+        await refresh()
+    }
+
+    func filterDevice(_ address: String?) async {
+        selectedDeviceAddress = address
+        await refresh()
     }
 
     func select(_ id: UUID?) async {
         selectedID = id
+        webSocketMessages = []
+        webSocketPage = .empty
         guard let id, let store else { selectedTransaction = nil; return }
         do {
             let loaded = try await store.load(id: id)
-            if selectedID == id { selectedTransaction = loaded }
+            if selectedID == id {
+                selectedTransaction = loaded
+                if loaded?.response?.status == 101 {
+                    let page = (try? await webSocketStore?.recent(transactionID: id)) ?? .empty
+                    if selectedID == id { webSocketPage = page; webSocketMessages = page.messages }
+                }
+            }
         }
         catch { errorMessage = error.localizedDescription }
     }
@@ -253,6 +321,58 @@ final class AppModel: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    func saveCapturePolicy(_ policy: CapturePolicy) async {
+        do {
+            try JSONEncoder().encode(policy).write(to: supportDirectory.appendingPathComponent("capture-policy.json"), options: .atomic)
+            capturePolicy = policy
+            await engine?.setCapturePolicy(policy)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func saveFocusPolicy(_ policy: FocusPolicy) async {
+        do {
+            try JSONEncoder().encode(policy).write(to: supportDirectory.appendingPathComponent("focus-policy.json"), options: .atomic)
+            focusPolicy = policy
+            await refresh()
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func focusHost(_ host: String) async {
+        var policy = focusPolicy
+        policy.enabled = true
+        if !policy.rules.contains(where: { $0.match.host == host && $0.match.path == "/*" }) {
+            policy.rules.append(CaptureRule(match: .init(host: host)))
+        }
+        await saveFocusPolicy(policy)
+    }
+
+    func sendRequest(_ request: ProxyRequest, replayOf: UUID? = nil) async -> Bool {
+        guard !sendingRequest, let engine else { return false }
+        sendingRequest = true
+        defer { sendingRequest = false; sendTask = nil }
+        let task = Task { try await engine.replay(request, replayOf: replayOf) }
+        sendTask = task
+        do {
+            let result = try await task.value
+            selectedDeviceAddress = nil
+            if focusPolicy.enabled { var policy = focusPolicy; policy.enabled = false; await saveFocusPolicy(policy) }
+            await refresh()
+            await select(result.id)
+            return true
+        } catch { errorMessage = error.localizedDescription; return false }
+    }
+
+    func replayRequest(_ id: UUID) async {
+        guard let store else { return }
+        do {
+            guard let original = try await store.load(id: id) else { return }
+            guard !original.requestBodyTruncated else { throw RequestComposerError.incompleteBody }
+            _ = await sendRequest(original.request, replayOf: id)
+        } catch { errorMessage = error.localizedDescription }
+    }
+
+    func cancelSend() { sendTask?.cancel() }
+
     func saveBreakpointRules(_ rules: [BreakpointRule]) async {
         breakpointRules = rules
         do {
@@ -268,20 +388,24 @@ final class AppModel: ObservableObject {
 
     func clearSession() async {
         do {
-            try await store?.clear()
+            if let engine { try await engine.clearSession() } else { try await store?.clear() }
             summaries = []
             selectedTransaction = nil
             selectedID = nil
+            webSocketMessages = []
+            webSocketPage = .empty
         } catch { errorMessage = error.localizedDescription }
     }
 
     func deleteRequest(_ id: UUID) async {
         do {
-            try await store?.remove(id: id)
+            if let engine { try await engine.deleteTransaction(id) } else { try await store?.remove(id: id) }
             summaries.removeAll { $0.id == id }
             if selectedID == id {
                 selectedID = nil
                 selectedTransaction = nil
+                webSocketMessages = []
+                webSocketPage = .empty
             }
         } catch { errorMessage = error.localizedDescription }
     }

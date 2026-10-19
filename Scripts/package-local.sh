@@ -43,6 +43,7 @@ cat > "$destination/Contents/Info.plist" <<'PLIST'
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>ProxyLab connects to devices on your local network to capture their HTTP and HTTPS requests when you enable Mobile Setup.</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
 </dict></plist>
 PLIST

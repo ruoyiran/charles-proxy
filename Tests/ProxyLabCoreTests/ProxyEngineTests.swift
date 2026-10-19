@@ -10,7 +10,7 @@ import Darwin
 final class ProxyEngineTests: XCTestCase {
     func testHTTPSCapturesBothHeadersAndBodiesIncludingCompressedResponse() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
-        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost", applicationProtocols: ["http/1.1"])
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: group)
             .childChannelInitializer { channel in
@@ -153,7 +153,7 @@ final class ProxyEngineTests: XCTestCase {
 
     func testOpaqueConnectCompletesTLSHandshakeToLocalOrigin() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
-        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost", applicationProtocols: ["http/1.1"])
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: originGroup)
             .childChannelInitializer { channel in
@@ -198,7 +198,7 @@ final class ProxyEngineTests: XCTestCase {
 
     func testOpaqueConnectCanUseResolvedAddressWhileKeepingOriginalTLSHost() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
-        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost", applicationProtocols: ["http/1.1"])
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: originGroup)
             .childChannelInitializer { channel in
@@ -240,7 +240,7 @@ final class ProxyEngineTests: XCTestCase {
 
     func testGoogleStyleCONNECTUsesTrustedDNSWhenSystemDNSReturnsPrivateAddress() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
-        let upstreamContext = try await upstreamCA.serverContext(for: "www.google.com.hk")
+        let upstreamContext = try await upstreamCA.serverContext(for: "www.google.com.hk", applicationProtocols: ["http/1.1"])
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: originGroup)
             .childChannelInitializer { channel in
@@ -335,7 +335,7 @@ final class ProxyEngineTests: XCTestCase {
 
     func testTrustedDNSCanRouteInterceptedHTTPSUpstream() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
-        let upstreamContext = try await upstreamCA.serverContext(for: "www.google.com.hk")
+        let upstreamContext = try await upstreamCA.serverContext(for: "www.google.com.hk", applicationProtocols: ["http/1.1"])
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: originGroup)
             .childChannelInitializer { channel in
@@ -384,7 +384,7 @@ final class ProxyEngineTests: XCTestCase {
 
     func testSelectedConnectHostIsDecryptedAndRecorded() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
-        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost", applicationProtocols: ["http/1.1"])
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: originGroup)
             .childChannelInitializer { channel in
