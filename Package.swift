@@ -30,6 +30,7 @@ let package = Package(
             .product(name: "GRDB", package: "GRDB.swift"),
         ]),
         .executableTarget(name: "ProxyLabApp", dependencies: ["ProxyLabCore"]),
+        .testTarget(name: "ProxyLabAppTests", dependencies: ["ProxyLabApp"]),
         .testTarget(name: "ProxyLabCoreTests", dependencies: [
             "ProxyLabCore",
             .product(name: "NIOCore", package: "swift-nio"),

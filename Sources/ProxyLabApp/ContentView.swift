@@ -165,7 +165,7 @@ private struct ProxySettingsView: View {
             Text("Proxy Settings").font(.title2).bold()
             HStack { Text("HTTP proxy port"); TextField("8888", text: $port).frame(width: 85) }
             Text("SSL Proxying locations").font(.headline)
-            Text(model.rootCertificateStatus).font(.caption).foregroundStyle(.secondary)
+            CertificateTrustStatusView()
             Text("One hostname or wildcard per line. Empty means HTTPS stays encrypted.")
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $hosts).font(.system(.body, design: .monospaced))
@@ -213,7 +213,7 @@ private struct CertificateGuideView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("SSL Proxying Certificate").font(.title2).bold()
-            Text(model.rootCertificateStatus).font(.callout).foregroundStyle(.secondary)
+            CertificateTrustStatusView()
             Text("1. Export the ProxyLab root certificate. The private key stays in this Mac's Keychain.")
             Text("2. Open Keychain Access, import the certificate into your login keychain, and explicitly trust it for SSL.")
             Text("3. Add the hostnames you want to inspect in Proxy Settings. Other HTTPS connections remain opaque tunnels.")
@@ -227,8 +227,33 @@ private struct CertificateGuideView: View {
                 Button("Done") { dismiss() }
             }
             Button("Check Certificate Trust Again") { Task { await model.refreshRootCertificateStatus() } }
+                .disabled(model.isCheckingCertificateTrust)
         }
         .padding(22)
         .task { await model.refreshRootCertificateStatus() }
+    }
+}
+
+private struct CertificateTrustStatusView: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                if model.isCheckingCertificateTrust {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: model.rootCertificateStatus == "Trusted for SSL" ? "checkmark.circle.fill" : "exclamationmark.circle")
+                        .foregroundStyle(model.rootCertificateStatus == "Trusted for SSL" ? .green : .orange)
+                }
+                Text(model.rootCertificateStatus)
+            }
+            .font(.callout)
+            if let checkedAt = model.certificateTrustCheckedAt {
+                Text("Check completed at \(checkedAt.formatted(.dateTime.hour().minute().second().secondFraction(.fractional(3)))).")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 }

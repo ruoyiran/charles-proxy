@@ -21,10 +21,13 @@ final class AppModel: ObservableObject {
     @Published var statusText = "Starting proxy…"
     @Published var errorMessage: String?
     @Published var rootCertificateStatus = "Not checked"
+    @Published var isCheckingCertificateTrust = false
+    @Published var certificateTrustCheckedAt: Date?
     @Published var sslSetupInProgress = false
 
     private let supportDirectory: URL
     private let proxySettings: SystemProxyManager
+    private let certificateTrustEvaluator: @Sendable (URL) async -> String
     private var store: SessionStore?
     private var engine: ProxyEngine?
     private var authority: CertificateAuthority?
@@ -32,7 +35,10 @@ final class AppModel: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var started = false
 
-    init() {
+    init(certificateTrustEvaluator: @escaping @Sendable (URL) async -> String = { url in
+        await Task.detached { AppModel.evaluateRootCertificate(at: url) }.value
+    }) {
+        self.certificateTrustEvaluator = certificateTrustEvaluator
         supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("ProxyLab", isDirectory: true)
         proxySettings = SystemProxyManager(snapshotURL: supportDirectory.appendingPathComponent("proxy-snapshot.plist"))
@@ -149,22 +155,32 @@ final class AppModel: ObservableObject {
     }
 
     func refreshRootCertificateStatus() async {
+        guard !isCheckingCertificateTrust else { return }
+        isCheckingCertificateTrust = true
+        rootCertificateStatus = "Checking certificate trust…"
+        certificateTrustCheckedAt = nil
         let rootURL = supportDirectory.appendingPathComponent("root-ca.pem")
-        rootCertificateStatus = await Task.detached {
-            guard let pem = try? String(contentsOf: rootURL, encoding: .utf8) else {
-                return "Not generated — export the root certificate first"
-            }
-            let base64 = pem.components(separatedBy: .newlines).filter { !$0.hasPrefix("---") }.joined()
-            guard let bytes = Data(base64Encoded: base64),
-                  let certificate = SecCertificateCreateWithData(nil, bytes as CFData) else {
-                return "Root certificate could not be read"
-            }
-            var trust: SecTrust?
-            guard SecTrustCreateWithCertificates(certificate, SecPolicyCreateSSL(true, nil), &trust) == errSecSuccess,
-                  let trust else { return "Certificate trust could not be checked" }
-            SecTrustSetNetworkFetchAllowed(trust, false)
-            return SecTrustEvaluateWithError(trust, nil) ? "Trusted for SSL" : "Not trusted for SSL — import and trust in Keychain Access"
-        }.value
+        rootCertificateStatus = await certificateTrustEvaluator(rootURL)
+        certificateTrustCheckedAt = Date()
+        isCheckingCertificateTrust = false
+    }
+
+    private nonisolated static func evaluateRootCertificate(at rootURL: URL) -> String {
+        guard let pem = try? String(contentsOf: rootURL, encoding: .utf8) else {
+            return "Not generated — export the root certificate first"
+        }
+        let base64 = pem.components(separatedBy: .newlines).filter { !$0.hasPrefix("---") }.joined()
+        guard let bytes = Data(base64Encoded: base64),
+              let certificate = SecCertificateCreateWithData(nil, bytes as CFData) else {
+            return "Root certificate could not be read"
+        }
+        var trust: SecTrust?
+        guard SecTrustCreateWithCertificates(certificate, SecPolicyCreateSSL(true, nil), &trust) == errSecSuccess,
+              let trust else { return "Certificate trust could not be checked" }
+        SecTrustSetNetworkFetchAllowed(trust, false)
+        var error: CFError?
+        if SecTrustEvaluateWithError(trust, &error) { return "Trusted for SSL" }
+        return "Not trusted for SSL — import and trust in Keychain Access"
     }
 
     func toggleRecording() async {
