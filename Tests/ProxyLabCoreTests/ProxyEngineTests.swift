@@ -99,6 +99,51 @@ final class ProxyEngineTests: XCTestCase {
         XCTAssertEqual(transactions.first?.tlsIntercepted, false)
     }
 
+    func testOpaqueConnectCompletesTLSHandshakeToLocalOrigin() async throws {
+        let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let origin = try await ServerBootstrap(group: originGroup)
+            .childChannelInitializer { channel in
+                do { try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: upstreamContext)) }
+                catch { return channel.eventLoop.makeFailedFuture(error) }
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(FixtureOriginHandler())
+                }
+            }
+            .bind(host: "127.0.0.1", port: 0).get()
+        let originPort = try XCTUnwrap(origin.localAddress?.port)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rootURL = directory.appendingPathComponent("upstream-root.pem")
+        try upstreamCA.rootCertificatePEM.write(to: rootURL, atomically: true, encoding: .utf8)
+        let store = try SessionStore(path: directory.appendingPathComponent("sessions.sqlite").path)
+        let proxy = ProxyEngine(store: store)
+        let proxyPort = try await proxy.start(port: 0)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--show-error", "--noproxy", "", "--proxy", "http://127.0.0.1:\(proxyPort)",
+                             "--cacert", rootURL.path, "https://localhost:\(originPort)/fixture"]
+        let output = Pipe()
+        let errors = Pipe()
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let body = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        await proxy.stop()
+        try await origin.close().get()
+        try await originGroup.shutdownGracefully()
+
+        XCTAssertEqual(process.terminationStatus, 0, stderr ?? "")
+        XCTAssertEqual(body, "hello from origin")
+        let transactions = try await store.list()
+        XCTAssertEqual(transactions.first?.request.method, "CONNECT")
+        XCTAssertEqual(transactions.first?.tlsIntercepted, false)
+    }
+
     func testSelectedConnectHostIsDecryptedAndRecorded() async throws {
         let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
         let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
