@@ -17,7 +17,9 @@ let package = Package(
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
     ],
     targets: [
+        .target(name: "CBodyCodec", linkerSettings: [.linkedLibrary("z")]),
         .target(name: "ProxyLabCore", dependencies: [
+            "CBodyCodec",
             .product(name: "NIOCore", package: "swift-nio"),
             .product(name: "NIOPosix", package: "swift-nio"),
             .product(name: "NIOHTTP1", package: "swift-nio"),

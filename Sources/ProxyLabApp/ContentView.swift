@@ -50,7 +50,10 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let transaction = model.selectedTransaction {
-                    TransactionDetailView(transaction: transaction)
+                    TransactionInspectorView(transaction: transaction,
+                                             showSSLSettings: { showSettings = true },
+                                             showCertificateGuide: { showCertificateGuide = true })
+                        .id(transaction.id)
                 } else {
                     ContentUnavailableView("Select a request", systemImage: "network",
                                            description: Text("Recorded requests appear in Sequence and Structure."))
@@ -83,6 +86,7 @@ struct ContentView: View {
                 Button { showRewrite = true } label: { Label("Rewrite", systemImage: "arrow.left.arrow.right") }
                 Button { showBreakpointRules = true } label: { Label("Breakpoints", systemImage: "pause.circle") }
                 Button { showSettings = true } label: { Label("Settings", systemImage: "gearshape") }
+                Button { showCertificateGuide = true } label: { Label("HTTPS Setup", systemImage: "lock.shield") }
                 Menu {
                     Button("Import HAR…") { Task { await model.importHAR() } }
                     Button("Export HAR…") { Task { await model.exportHAR() } }
@@ -96,7 +100,7 @@ struct ContentView: View {
         .sheet(isPresented: $showBreakpointRules) { BreakpointRulesView().environmentObject(model).frame(minWidth: 540, minHeight: 380) }
         .sheet(isPresented: $showPending) { PendingBreakpointsView().environmentObject(model).frame(minWidth: 760, minHeight: 500) }
         .sheet(isPresented: $showSettings) { ProxySettingsView().environmentObject(model).frame(minWidth: 540, minHeight: 570) }
-        .sheet(isPresented: $showCertificateGuide) { CertificateGuideView().environmentObject(model).frame(minWidth: 540, minHeight: 350) }
+        .sheet(isPresented: $showCertificateGuide) { CertificateGuideView().environmentObject(model).frame(minWidth: 600, minHeight: 400) }
         .confirmationDialog("Clear all recorded requests?", isPresented: $confirmClearSession) {
             Button("Clear Session", role: .destructive) { Task { await model.clearSession() } }
         } message: {
@@ -149,89 +153,6 @@ struct ContentView: View {
     }
 }
 
-private struct TransactionDetailView: View {
-    let transaction: CapturedTransaction
-    @State private var tab = 0
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(transaction.request.url).font(.headline).textSelection(.enabled)
-                HStack {
-                    Text(transaction.request.method).font(.caption.monospaced()).bold()
-                    if let status = transaction.response?.status { Text("HTTP \(status)") }
-                    if transaction.tlsIntercepted { Label("SSL Proxying", systemImage: "lock.shield") }
-                    Spacer()
-                    Text(transaction.startedAt.formatted(date: .abbreviated, time: .standard))
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            .padding(14)
-            Divider()
-            Picker("Details", selection: $tab) {
-                Text("Overview").tag(0)
-                Text("Request").tag(1)
-                Text("Response").tag(2)
-                Text("Timeline").tag(3)
-                Text("SSL").tag(4)
-            }
-            .pickerStyle(.segmented)
-            .padding(12)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    switch tab {
-                    case 0:
-                        section("URL", transaction.request.url)
-                        section("Method", transaction.request.method)
-                        section("Status", transaction.response.map { String($0.status) } ?? "No response")
-                        if let error = transaction.error { section("Error", error) }
-                        section("Request bytes retained", "\(transaction.request.body.count)\(transaction.requestBodyTruncated ? " (truncated)" : "")")
-                        section("Response bytes retained", "\(transaction.response?.body.count ?? 0)\(transaction.responseBodyTruncated ? " (truncated)" : "")")
-                    case 1:
-                        section("Headers", formattedHeaders(transaction.request.headers))
-                        section("Body", bodyPreview(transaction.request.body))
-                    case 2:
-                        section("Headers", formattedHeaders(transaction.response?.headers ?? []))
-                        section("Body", bodyPreview(transaction.response?.body ?? Data()))
-                    case 3:
-                        section("Started", transaction.startedAt.formatted(date: .complete, time: .complete))
-                        if let end = transaction.endedAt {
-                            section("Completed", end.formatted(date: .complete, time: .complete))
-                            section("Duration", String(format: "%.1f ms", end.timeIntervalSince(transaction.startedAt) * 1_000))
-                        }
-                    default:
-                        section("TLS inspection", transaction.tlsIntercepted ? "Decrypted with ProxyLab's local CA" : "Not decrypted")
-                        section("Certificate pinning", "Apps that pin their server certificate may reject local inspection.")
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(14)
-            }
-        }
-    }
-
-    private func section(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.caption).bold().foregroundStyle(.secondary)
-            Text(value.isEmpty ? "—" : value).font(.system(.body, design: .monospaced)).textSelection(.enabled)
-        }
-    }
-
-    private func formattedHeaders(_ headers: [HTTPHeader]) -> String {
-        headers.map { "\($0.name): \($0.value)" }.joined(separator: "\n")
-    }
-
-    private func bodyPreview(_ data: Data) -> String {
-        if data.isEmpty { return "—" }
-        let prefix = data.prefix(64 * 1_024)
-        if let text = String(data: prefix, encoding: .utf8) {
-            return text + (data.count > prefix.count ? "\n… preview limited to 64 KB" : "")
-        }
-        return prefix.prefix(256).map { String(format: "%02x", $0) }.joined(separator: " ") + "\n(binary preview)"
-    }
-}
-
 private struct ProxySettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -244,6 +165,7 @@ private struct ProxySettingsView: View {
             Text("Proxy Settings").font(.title2).bold()
             HStack { Text("HTTP proxy port"); TextField("8888", text: $port).frame(width: 85) }
             Text("SSL Proxying locations").font(.headline)
+            Text(model.rootCertificateStatus).font(.caption).foregroundStyle(.secondary)
             Text("One hostname or wildcard per line. Empty means HTTPS stays encrypted.")
                 .font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $hosts).font(.system(.body, design: .monospaced))
@@ -269,7 +191,9 @@ private struct ProxySettingsView: View {
                         dismiss()
                     }
                 }
+                .disabled(model.sslSetupInProgress)
                 .keyboardShortcut(.defaultAction)
+                if model.sslSetupInProgress { ProgressView().controlSize(.small) }
             }
         }
         .padding(20)
@@ -278,6 +202,7 @@ private struct ProxySettingsView: View {
             trustedDNSHosts = model.trustedDNSHostsText
             port = String(model.proxyPort)
         }
+        .task { await model.refreshRootCertificateStatus() }
     }
 }
 
@@ -288,6 +213,7 @@ private struct CertificateGuideView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("SSL Proxying Certificate").font(.title2).bold()
+            Text(model.rootCertificateStatus).font(.callout).foregroundStyle(.secondary)
             Text("1. Export the ProxyLab root certificate. The private key stays in this Mac's Keychain.")
             Text("2. Open Keychain Access, import the certificate into your login keychain, and explicitly trust it for SSL.")
             Text("3. Add the hostnames you want to inspect in Proxy Settings. Other HTTPS connections remain opaque tunnels.")
@@ -300,7 +226,9 @@ private struct CertificateGuideView: View {
                 Spacer()
                 Button("Done") { dismiss() }
             }
+            Button("Check Certificate Trust Again") { Task { await model.refreshRootCertificateStatus() } }
         }
         .padding(22)
+        .task { await model.refreshRootCertificateStatus() }
     }
 }

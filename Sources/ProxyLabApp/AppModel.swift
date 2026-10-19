@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ProxyLabCore
+import Security
 import SwiftUI
 
 @MainActor
@@ -19,6 +20,8 @@ final class AppModel: ObservableObject {
     @Published var proxyPort = 8888
     @Published var statusText = "Starting proxy…"
     @Published var errorMessage: String?
+    @Published var rootCertificateStatus = "Not checked"
+    @Published var sslSetupInProgress = false
 
     private let supportDirectory: URL
     private let proxySettings: SystemProxyManager
@@ -126,8 +129,42 @@ final class AppModel: ObservableObject {
     func select(_ id: UUID?) async {
         selectedID = id
         guard let id, let store else { selectedTransaction = nil; return }
-        do { selectedTransaction = try await store.load(id: id) }
+        do {
+            let loaded = try await store.load(id: id)
+            if selectedID == id { selectedTransaction = loaded }
+        }
         catch { errorMessage = error.localizedDescription }
+    }
+
+    func enableSSLForSelectedHost() async {
+        guard let host = selectedTransaction.flatMap({ URL(string: $0.request.url)?.host }) else { return }
+        await refreshRootCertificateStatus()
+        guard rootCertificateStatus == "Trusted for SSL" else {
+            errorMessage = "Open HTTPS Setup, export the root certificate, and trust it for SSL in Keychain Access first. Then enable SSL Proxying for \(host) and reload the page."
+            return
+        }
+        var hosts = sslHostPatterns
+        if !hosts.contains(host) { hosts.append(host) }
+        await updateSSLHosts(hosts.joined(separator: "\n"))
+    }
+
+    func refreshRootCertificateStatus() async {
+        let rootURL = supportDirectory.appendingPathComponent("root-ca.pem")
+        rootCertificateStatus = await Task.detached {
+            guard let pem = try? String(contentsOf: rootURL, encoding: .utf8) else {
+                return "Not generated — export the root certificate first"
+            }
+            let base64 = pem.components(separatedBy: .newlines).filter { !$0.hasPrefix("---") }.joined()
+            guard let bytes = Data(base64Encoded: base64),
+                  let certificate = SecCertificateCreateWithData(nil, bytes as CFData) else {
+                return "Root certificate could not be read"
+            }
+            var trust: SecTrust?
+            guard SecTrustCreateWithCertificates(certificate, SecPolicyCreateSSL(true, nil), &trust) == errSecSuccess,
+                  let trust else { return "Certificate trust could not be checked" }
+            SecTrustSetNetworkFetchAllowed(trust, false)
+            return SecTrustEvaluateWithError(trust, nil) ? "Trusted for SSL" : "Not trusted for SSL — import and trust in Keychain Access"
+        }.value
     }
 
     func toggleRecording() async {
@@ -166,6 +203,8 @@ final class AppModel: ObservableObject {
 
     func updateSSLHosts(_ text: String) async {
         sslHostsText = text
+        sslSetupInProgress = true
+        defer { sslSetupInProgress = false }
         do {
             try text.write(to: supportDirectory.appendingPathComponent("ssl-hosts.txt"), atomically: true, encoding: .utf8)
             if let engine {
@@ -263,13 +302,17 @@ final class AppModel: ObservableObject {
     }
 
     func exportRootCertificate() async {
-        let authority: CertificateAuthority
-        do { authority = try await ensureAuthority() }
-        catch { errorMessage = error.localizedDescription; return }
+        let pem: String
+        if let stored = try? String(contentsOf: supportDirectory.appendingPathComponent("root-ca.pem"), encoding: .utf8) {
+            pem = stored
+        } else {
+            do { pem = try await ensureAuthority().rootCertificatePEM }
+            catch { errorMessage = error.localizedDescription; return }
+        }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "ProxyLab-Root-CA.pem"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try authority.rootCertificatePEM.write(to: url, atomically: true, encoding: .utf8) }
+        do { try pem.write(to: url, atomically: true, encoding: .utf8) }
         catch { errorMessage = error.localizedDescription }
     }
 }

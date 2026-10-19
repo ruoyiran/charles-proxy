@@ -8,6 +8,58 @@ import Darwin
 @testable import ProxyLabCore
 
 final class ProxyEngineTests: XCTestCase {
+    func testHTTPSCapturesBothHeadersAndBodiesIncludingCompressedResponse() async throws {
+        let upstreamCA = try CertificateAuthority(persistentDirectory: nil)
+        let upstreamContext = try await upstreamCA.serverContext(for: "localhost")
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        let origin = try await ServerBootstrap(group: group)
+            .childChannelInitializer { channel in
+                do { try channel.pipeline.syncOperations.addHandler(NIOSSLServerHandler(context: upstreamContext)) }
+                catch { return channel.eventLoop.makeFailedFuture(error) }
+                return channel.pipeline.configureHTTPServerPipeline().flatMap {
+                    channel.pipeline.addHandler(CompressedJSONOriginHandler())
+                }
+            }.bind(host: "127.0.0.1", port: 0).get()
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rootURL = directory.appendingPathComponent("proxy-root.pem")
+        let proxyCA = try CertificateAuthority(persistentDirectory: nil)
+        try proxyCA.rootCertificatePEM.write(to: rootURL, atomically: true, encoding: .utf8)
+        var tls = TLSConfiguration.makeClientConfiguration()
+        tls.trustRoots = .certificates([try NIOSSLCertificate(bytes: Array(upstreamCA.rootCertificateDER), format: .der)])
+        let store = try SessionStore(path: directory.appendingPathComponent("sessions.sqlite").path)
+        let proxy = ProxyEngine(store: store, upstreamTLSConfiguration: tls)
+        await proxy.configureTLS(authority: proxyCA, includeHosts: ["localhost"])
+        let port = try await proxy.start(port: 0)
+        let originPort = try XCTUnwrap(origin.localAddress?.port)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--show-error", "--noproxy", "", "--max-time", "10",
+                             "--proxy", "http://127.0.0.1:\(port)", "--cacert", rootURL.path,
+                             "-H", "Content-Type: application/json", "-H", "X-Inspection-Test: request-header",
+                             "--data-binary", "{\"sent\":true}", "https://localhost:\(originPort)/inspect"]
+        let output = Pipe()
+        process.standardOutput = output
+        try process.run()
+        while process.isRunning { try await Task.sleep(for: .milliseconds(10)) }
+        let received = output.fileHandleForReading.readDataToEndOfFile()
+        await proxy.stop()
+        try await origin.close().get()
+        try await group.shutdownGracefully()
+        let records = try await store.list()
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(record.tlsIntercepted)
+        XCTAssertEqual(record.request.header("X-Inspection-Test"), "request-header")
+        XCTAssertEqual(record.request.body, Data("{\"sent\":true}".utf8))
+        XCTAssertEqual(record.response?.header("X-Inspection-Test"), "response-header")
+        XCTAssertEqual(record.response?.headers.filter { $0.name.lowercased() == "set-cookie" }.count, 2)
+        XCTAssertEqual(record.response?.body, received)
+        XCTAssertEqual(try BodyContent.decode(received, contentEncoding: record.response?.header("Content-Encoding")),
+                       Data("{\"message\":\"captured response\",\"ok\":true}".utf8))
+    }
+
     func testForwardsHTTPAndRecordsCompletedTransaction() async throws {
         let originGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let origin = try await ServerBootstrap(group: originGroup)
@@ -713,6 +765,26 @@ private final class FixtureOriginHandler: ChannelInboundHandler, @unchecked Send
             context.write(wrapOutboundOut(.body(.byteBuffer(ByteBuffer(string: body)))), promise: nil)
             context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
         }
+    }
+}
+
+private final class CompressedJSONOriginHandler: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = HTTPServerRequestPart
+    typealias OutboundOut = HTTPServerResponsePart
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard case .end = unwrapInboundIn(data) else { return }
+        let bytes = Data(base64Encoded: "H4sIAAAAAAACE6tWyk0tLk5MT1WyUkpOLCgpLUpNUShKLS7IzytOVdJRys9WsiopKk2tBQAd+Z4BKQAAAA==")!
+        var headers = HTTPHeaders()
+        headers.add(name: "Content-Type", value: "application/json; charset=utf-8")
+        headers.add(name: "Content-Encoding", value: "gzip")
+        headers.add(name: "Content-Length", value: String(bytes.count))
+        headers.add(name: "X-Inspection-Test", value: "response-header")
+        headers.add(name: "Set-Cookie", value: "first=1")
+        headers.add(name: "Set-Cookie", value: "second=2")
+        context.write(wrapOutboundOut(.head(HTTPResponseHead(version: .http1_1, status: .ok, headers: headers))), promise: nil)
+        context.write(wrapOutboundOut(.body(.byteBuffer(ByteBuffer(bytes: bytes)))), promise: nil)
+        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
     }
 }
 

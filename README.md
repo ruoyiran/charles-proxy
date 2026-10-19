@@ -24,6 +24,8 @@ If a site fails because the local DNS server returns an unusable address, add it
 
 macOS may request Keychain access the first time a locally signed build uses the CA, or after the app is rebuilt with a new ad-hoc signature. Grant access only when you are intentionally enabling HTTPS inspection.
 
+Select a captured GET or POST and use **Request Headers**, **Request Body**, **Response Headers**, and **Response Body** in the inspector. Body views support decoded text, JSON formatting, raw bytes, and hexadecimal output, with copy and save actions. Decoded display supports gzip, deflate, and Brotli while preserving the captured bytes. A CONNECT entry is an encrypted tunnel; use its **HTTPS Setup** and **Enable SSL Proxying for This Host** actions, then reload the page to create new decrypted records. Earlier tunnel records cannot be decrypted retrospectively.
+
 Sessions are stored in `~/Library/Application Support/ProxyLab/sessions.sqlite`. Only the first 10 MB of each request or response body is retained; larger traffic still passes through. Imported HAR records are viewable alongside captured requests.
 
 HTTP/2, gRPC, WebSocket message inspection, QUIC/HTTP/3, remote-device capture, and Charles proprietary session formats are outside this first release.
